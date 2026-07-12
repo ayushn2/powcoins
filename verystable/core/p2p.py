@@ -248,14 +248,20 @@ class P2PConnection(asyncio.Protocol):
                     raise ValueError("got bad checksum " + repr(self.recvbuf))
                 self.recvbuf = self.recvbuf[4+12+4+4+msglen:]
                 if msgtype not in MESSAGEMAP:
-                    raise ValueError("Received unknown msgtype from %s:%d: '%s' %s" % (self.dstaddr, self.dstport, msgtype, repr(msg)))
+                    logger.warning(
+                        "Ignoring unknown msgtype from %s:%d: '%s'",
+                        self.dstaddr,
+                        self.dstport,
+                        msgtype.decode(errors="replace"),
+                    )
+                    continue
                 f = BytesIO(msg)
                 t = MESSAGEMAP[msgtype]()
                 t.deserialize(f)
                 self._log_message("receive", t)
                 self.on_message(t)
         except Exception as e:
-            logger.exception('Error reading message:', repr(e))
+            logger.exception("Error reading message: %s", e)
             raise
 
     def on_message(self, message):
