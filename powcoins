@@ -2,20 +2,27 @@
 # Copyright (c) 2015-2024 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test (OP_CAT)
-"""
+"""Claim coins from the PoW-limited signet faucet (OP_CAT)."""
 
 import argparse
+import base64
+import collections
+import dataclasses
+from decimal import Decimal
+import functools
 import hashlib
+from io import BytesIO
 import json
 import logging
 import math
-import os
 import random
 import socket
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 from verystable.core.messages import (
     CInv,
@@ -28,9 +35,8 @@ from verystable.core.messages import (
     hash256,
     msg_inv,
     msg_tx,
-    tx_from_hex,
 )
-from verystable.core.p2p import P2PInterface, NetworkThread, MAGIC_BYTES
+from verystable.core.p2p import P2PInterface, NetworkThread
 from verystable.core.script import (
     SIGHASH_DEFAULT,
     TaprootSignatureHash,
@@ -39,74 +45,264 @@ from verystable.core.script import (
 from verystable.core.key import ECKey, compute_xonly_pubkey, sign_schnorr
 from verystable.core.address import address_to_scriptpubkey
 
-if False:
-    """PoW-limited faucet using OP_CAT (idea by ajtowns, see
-       https://twitter.com/ajtowns/status/1785842090607591712,
-       https://github.com/theStack/bitcoin-inquisition/issues/1#issue-2282650357 and
-       https://github.com/theStack/bitcoin-inquisition/issues/1#issuecomment-2102898015).
 
-       To spend a fauCAT output, provide a signature S together with
-       a nonce S, such that sha256(N || S) ends with a certain count of
-       zero-bits (the "difficulty" D). The non-zero-bytes part of the
-       PoW-hash has to be provided in two (core part HA, last non-zero byte HB).
+# BIP-341 NUMS point: lift_x(sha256(encode(G))), unknown discrete log
+NUMS_IPK = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
 
-       Witness stack for spending:
-            - P (x-only public key [32 bytes])
-            - S (signature [64 bytes, i.e. implicit SIGHASH_ALL])
-            - N (nonce string)
-            - HA (core part of hash)
-            - HB (last non-zero byte of hash)
-            - D (difficulty, number of trailing zero-bits [CScriptNum in range 0-63])
+# Existing faucet internal pubkey (known discrete log)
+LEGACY_IPK = bytes.fromhex("4a981eda2acd9bf5d789fa1a9b7f95677776d99fd13ec0f658f0e4dbc5b5c878")
+
+# Ephemeral signing key (privkey=1) used for all claims
+CLAIM_PRIVKEY = ECKey()
+CLAIM_PRIVKEY.set(int(1).to_bytes(32, 'big'), compressed=True)
+CLAIM_PUBKEY, _ = compute_xonly_pubkey(CLAIM_PRIVKEY.get_bytes())
+
+def btc_to_sats(btc):
+    return int(Decimal(str(btc)).quantize(Decimal('1e-8')) * Decimal('100000000'))
+
+# Scheduler constants (see powcoins-scheduler.md, powcoins-scheduler-delta.md)
+BLOCK_INTERVAL = 600  # signet block interval in seconds
+HASHRATE_DEFAULT = 0.5e12  # H/s (0.5 TH/s Bitaxe) — initial estimate
+HASHRATE_HALF_LIFE = 7200  # 2 hours
+HASHRATE_STEP = 1800  # 30 minutes — quantization step for read-side stability
+
+# Hazard table: empirical competitor claim rates per (dv, r) bin
+# Accounting uses a lagged tip H <= node_tip - HAZARD_CONFIRMATIONS so K only
+# counts spends once they have N confirmations (avoids mempool bookkeeping).
+HAZARD_DECAY_HALF_LIFE = 1008  # blocks; E and K decay with this half-life
+HAZARD_E0 = 1000.0             # prior exposure weight (coin-blocks)
+HAZARD_CONFIRMATIONS = 6       # lag before finalizing spends / advancing H
+
+# --- Script construction ---
+
+# Script structure (legacy variant):
+#   prefix: validate difficulty in [mindiff, maxdiff), leave D and D-mindiff on stack
+#   variable: multiply (D-mindiff) by dropdiff, compute CSV lock = max_csv - product
+#   suffix: PoW hash verification and CHECKSIG
+#
+# Witness stack: sig, pubkey, prefix(3B), suffix(11B), h_b(variable), h_a(1B),
+#                difficulty(1B), script, control_block(33B)
+
+def _push_int(n):
+    """Encode n as a minimal Script data push."""
+    if n == 0:
+        return bytes([0x00])
+    neg = n < 0
+    n = abs(n)
+    data = []
+    while n > 0:
+        data.append(n & 0xff)
+        n >>= 8
+    if data[-1] & 0x80:
+        data.append(0x80 if neg else 0x00)
+    elif neg:
+        data[-1] |= 0x80
+    return bytes([len(data)] + data)
+
+def _stack_multiply_ops(k):
+    """Opcodes to multiply top-of-stack by integer k (consuming it)."""
+    if k == 1:
+        return bytes()
+    bits = bin(k)[2:]
+    ops = []
+    for i in range(1, len(bits)):
+        if bits[i] == '1':
+            ops.append(0x76)  # DUP (save for later add)
+        ops.append(0x76)  # DUP
+        ops.append(0x93)  # ADD (double)
+    ops.extend([0x93] * bits[1:].count('1'))
+    return bytes(ops)
+
+# 16 SUB DUP 0 GREATERTHANOREQUAL VERIFY DUP 64 LESSTHAN VERIFY
+_SCRIPT_PREFIX = bytes.fromhex('60947600a2697601409f69')
+
+# SWAP SUB CSV DROP, then PoW hash construction from h_b/h_a witness items
+_SCRIPT_POWCHECK = bytes.fromhex(
+    '7c94b275'  # SWAP SUB CSV DROP
+    '0200006b'  # push 0, TOALTSTACK
+    '760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894'
+    '687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387'
+    '630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b'
+)
+
+# Legacy: assemble 0x03||prefix(3)||sig(64)||0x0b||suffix(11), HASH256 check, CHECKSIG
+_ASSEMBLY_LEGACY = bytes.fromhex(
+    '70'  # 2OVER (copy sig, pubkey from below prefix, suffix)
+    '8201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac'
+)
+
+# Stratum_a: Stratum-compatible variant. prevhash = sha256(prevpre) varies per
+# work-height; pubkey stays constant. merkle_root = hash256(cbhash || hash256(sig)).
+# witness order: prefix, prevpre, suffix, cbhash, sig, pubkey
+# assemble prefix(4)||sha256(prevpre)(32)||merkle_root(32)||suffix(12), HASH256 check
+_ASSEMBLY_STRATUM_A = bytes.fromhex(
+    '82012088'                # SIZE 32 EQUALVERIFY (pubkey)
+    '7882014088 7c'           # OVER SIZE 64 EQUALVERIFY SWAP (sig)
+    'ad'                      # CHECKSIGVERIFY
+    'aa7eaa'                  # HASH256 CAT HASH256 (merkle_root)
+    '7c825c887e'              # SWAP SIZE OP_12 EQUALVERIFY CAT (suffix)
+    '7ca87c7e7e'              # SWAP SHA256 SWAP CAT CAT (prevpre→prevhash)
+    '82015088'                # SIZE 80 EQUALVERIFY
+    'aa6c87'                  # HASH256 FROMALTSTACK EQUAL
+)
+
+SCRIPT_VARIANTS = {'legacy': _ASSEMBLY_LEGACY, 'stratum_a': _ASSEMBLY_STRATUM_A}
+
+def build_script(dropdiff, mindiff, maxdiff, variant='legacy'):
+    """Build a powcoins faucet script with given parameters."""
+    max_csv = (maxdiff - mindiff) * dropdiff
+    var = bytes([0x76]) + _stack_multiply_ops(dropdiff) + _push_int(max_csv)
+    assembly = SCRIPT_VARIANTS[variant]
+    return _SCRIPT_PREFIX + var + _SCRIPT_POWCHECK + assembly
+
+def witness_weight(script, d, variant='legacy', cbhash_len=0, prevpre_len=0):
+    """Witness weight for a claim at given d (approximate).
+
+    The h_b field varies with d so this isn't constant.
+    For fee estimation, use d=mindiff (worst case / max weight).
     """
+    h_b_len = 32 - d // 8 - 1
+    cs_script = 1 if len(script) < 253 else 3
+    if variant == 'stratum_a':
+        return (1              # witness item count
+              + 1 + 64         # signature
+              + 1 + 32         # pubkey
+              + 1 + cbhash_len # cbhash (0 for CPU, 32 for Stratum)
+              + 1 + prevpre_len # prevpre (0 for CPU, varies for Stratum)
+              + 1 + 4          # prefix (version)
+              + 1 + 12         # suffix (time+nbits+nonce)
+              + 1 + h_b_len    # h_b
+              + 1 + 1          # h_a
+              + 1 + 1          # difficulty
+              + cs_script + len(script)
+              + 1 + 33)        # control_block
+    return (1              # witness item count
+          + 1 + 64         # signature
+          + 1 + 32         # pubkey
+          + 1 + 3          # prefix
+          + 1 + 11         # suffix
+          + 1 + h_b_len    # h_b
+          + 1 + 1          # h_a
+          + 1 + 1          # difficulty
+          + cs_script + len(script)
+          + 1 + 33)        # control_block
 
-#### aspects
-# 1. get the script + address
-#    (maybe parameterised by min/max difficulty, delay, internal pubkey)
-# 2. setup an rpcwallet to track address
-# 3. get the best unspent utxo to work on
-# 4. generate a signature, given where you want the funds to go to
-# 5. generate a pow job based on the signature
-# 6. generate (and submit) a valid tx given the utxo, signature and pow
-
-# fields are:
-#  * number of blocks before difficulty drops
-#  * min difficulty
-#  * max difficulty
-#  * extraweight
-#  * hash the signature first (and don't add length of the suffix)
-#  * script
 SCRIPTS = [
-  (10, 16, 80, 360, False, bytes.fromhex("60947600a2697601409f697676937676937693930280027c94b2750200006b760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b708201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac")),
-  (4, 16, 80, 356, False, bytes.fromhex("60947600a2697601409f6976769376930200017c94b2750200006b760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b708201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac")),
-  (1, 16, 80, 351, False, bytes.fromhex("60947600a2697601409f697601407c94b2750200006b760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b708201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac")),
+    (10, 16, 80, 'legacy', LEGACY_IPK),
+    (4, 16, 80, 'legacy', LEGACY_IPK),
+    (1, 16, 80, 'legacy', LEGACY_IPK),
+    (10, 16, 80, 'stratum_a', LEGACY_IPK),
+    (4, 16, 80, 'stratum_a', LEGACY_IPK),
+    (1, 16, 80, 'stratum_a', LEGACY_IPK),
+    (10, 16, 80, 'stratum_a', NUMS_IPK),
+    (4, 16, 80, 'stratum_a', NUMS_IPK),
+    (1, 16, 80, 'stratum_a', NUMS_IPK),
 ]
-ipk = bytes.fromhex("4a981eda2acd9bf5d789fa1a9b7f95677776d99fd13ec0f658f0e4dbc5b5c878")
 
 def get_tapinfo(args):
     tapinfo = {}
-    for dropdiff, mindiff, maxdiff, extraweight, hashsig, script in SCRIPTS:
+    for dropdiff, mindiff, maxdiff, variant, ipk in SCRIPTS:
+        script = build_script(dropdiff, mindiff, maxdiff, variant)
         ti = taproot_construct(ipk, [("only-path", script)])
         spk = ti.scriptPubKey.hex()
         faucet_addr = json.loads(args.bcli("decodescript", spk)).get("address", None)
         if faucet_addr is None:
-            logging.error(f"Faucet address for delay {dropdiff} is unknown?? (spk={spk})")
-            return 1
+            logging.warning(f"Faucet address for delay {dropdiff} is unknown (spk={spk}), skipping")
+            continue
         logging.debug(f"Faucet address {faucet_addr} (delay={dropdiff})")
 
         if spk in tapinfo:
-            logging.error(f"Duplicate faucet address for delays {tapinfo[spk][0]} and {dropdiff}")
-            return 1
-        tapinfo[spk] = (dropdiff, mindiff, maxdiff, extraweight, hashsig, script, ti, faucet_addr)
+            logging.warning(f"Duplicate faucet address for delays {tapinfo[spk][0]} and {dropdiff}, skipping")
+            continue
+        tapinfo[spk] = (dropdiff, mindiff, maxdiff, variant, script, ti, ipk, faucet_addr)
     return tapinfo
+
+def _fmt_diff(n):
+    d = 2**(n - 32)
+    for suffix, threshold in [("T", 1e12), ("G", 1e9), ("M", 1e6), ("k", 1e3)]:
+        if d >= threshold:
+            return f"{d/threshold:.1f}{suffix}"
+    if d >= 0.01:
+        return f"{d:.2f}"
+    return f"{d:f}".rstrip('0')
+
+CoinMeta = collections.namedtuple('CoinMeta', [
+    'conf', 'txid', 'vout', 'coin', 'sats', 'logsats',
+    'delay', 'mindiff', 'maxdiff', 'difficulty', 'variant', 'script', 'tapinfo', 'ipk',
+])
+
+WorkItem = collections.namedtuple('WorkItem', [
+    'sig', 'difficulty', 'claim_amount', 'claim_spk',
+    'txid', 'vout', 'csv',
+])
+
+@dataclasses.dataclass(frozen=True)
+class WorkSnapshot:
+    work: object       # WorkItem | None
+    work_height: int
+    prevpre_hash: bytes
+    tip_height: int
+
+ScheduleSlot = collections.namedtuple('ScheduleSlot', [
+    'deadline', 'coin', 'd', 'logmv',
+])
+
+def _d_to_nbits(d):
+    n = 256 - d
+    nsize = (n + 8) // 8
+    mantissa = 1 << (n - 8 * (nsize - 3))
+    if mantissa & 0x800000:
+        mantissa >>= 8
+        nsize += 1
+    return f"{nsize:02x}{mantissa:06x}"
+
+def _d_to_target(d):
+    return f"{1 << (256 - d):064x}"
+
+def synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+def coins_meta(tapinfo, coins, future=0):
+    """Resolve coin metadata from tapinfo.
+
+    Returns a list of CoinMeta with precomputed difficulty and logsats.
+    """
+    metas = []
+    for c in coins:
+        if c["scriptPubKey"] not in tapinfo:
+            continue
+        d, mindiff, maxdiff, variant, script, ti, ipk, _ = tapinfo[c["scriptPubKey"]]
+        conf = (c["confirmations"] + future) // d
+        diff = max(maxdiff - conf, mindiff)
+        sats = btc_to_sats(c["amount"])
+        logsats = math.log2(sats)
+        metas.append(CoinMeta(c["confirmations"] + future, c["txid"], c["vout"], c, sats, logsats, d, mindiff, maxdiff, diff, variant, script, ti, ipk))
+    return metas
+
+def do_info(args):
+    tapinfo = get_tapinfo(args)
+    if isinstance(tapinfo, int):
+        return tapinfo
+    for spk, (dropdiff, mindiff, maxdiff, variant, script, ti, ipk, addr) in tapinfo.items():
+        ipk_name = "NUMS" if ipk == NUMS_IPK else "legacy" if ipk == LEGACY_IPK else ipk.hex()[:16] + "..."
+        print(f"{addr}")
+        max_csv = (maxdiff - mindiff) * dropdiff
+        print(f"  difficulty={_fmt_diff(maxdiff)}..{_fmt_diff(mindiff)} over {max_csv} blocks, mode={variant} ipk={ipk_name}")
+        print(f"  script={len(script)}B script={script.hex()}")
+    return 0
 
 def do_setupwallet(args):
     tapinfo = get_tapinfo(args)
     args.bcli("-named", "createwallet", f"wallet_name={args.wallet}", "disable_private_keys=true", "descriptors=true", "load_on_startup=true")
 
     descinfo = []
-    for spk, (n, mindiff, maxdiff, extraweight, hashsig, script, ti, addr) in tapinfo.items():
+    for spk, (dropdiff, mindiff, maxdiff, variant, script, ti, ipk, addr) in tapinfo.items():
         desc = json.loads(args.bcli("getdescriptorinfo", f"addr({addr})")).get("descriptor")
-        descinfo.append(dict(desc=desc, timestamp=int(time.time() - 600*128*n)))
+        descinfo.append(dict(desc=desc, timestamp=int(time.time() - 600*128*dropdiff)))
     args.bcli(f"-rpcwallet={args.wallet}", "importdescriptors", json.dumps(descinfo))
     return 0
 
@@ -160,107 +356,1237 @@ def do_claim(args):
 
     coins = json.loads(args.bcli(f"-rpcwallet={args.wallet}", "listunspent"))
 
-    scored = []
-    found = False
-    easiest = 99
-    for c in coins:
-        if c["scriptPubKey"] not in tapinfo: continue # don't know how to spend
-        d, mindiff, maxdiff, extraweight, hashsig, script, ti, _ = tapinfo[c["scriptPubKey"]]
-        found = True
-        conf = c["confirmations"]//d
-        diff = max(maxdiff - conf, mindiff)
-        easiest = min(diff, easiest)
-        if diff > args.max_difficulty: continue # too difficult
-        score = math.log(c["amount"], 2) - diff + random.random()
-        scored.append((score, c["confirmations"], c["txid"], c["vout"], c, d, mindiff, maxdiff, extraweight, hashsig, script, ti))
-    if not found:
+    future = getattr(args, 'future', 0) or 0
+    metas = coins_meta(tapinfo, coins, future)
+    if not metas:
         logging.error("Faucet is empty")
         return 1
-    elif not scored:
+    easiest = min(c.difficulty for c in metas)
+    if easiest > args.max_difficulty:
         logging.error(f"Faucet is too difficult (min difficulty {easiest})")
         return 1
-    scored = sorted(scored)
 
-    # best one!
-    score, conf, txid, vout, c, delay, mindiff, maxdiff, extraweight, hashsig, script, tapinfo = scored[-1]
-    amount = int(c["amount"]*1e8)
-    difficulty = max(mindiff, maxdiff - conf//delay)
-    invdiff = maxdiff - difficulty
-    csv = invdiff * delay
-    assert conf >= csv >= 0
+    _, best = max((c.logsats - c.difficulty + random.random(), c) for c in metas if c.difficulty <= args.max_difficulty)
 
-    if c["scriptPubKey"] != tapinfo.scriptPubKey.hex():
-        logging.error("Best coin in wallet has wrong scriptPubKey (%s != %s)" % (c["scriptPubKey"], tapinfo.scriptPubKey.hex()))
+    amount = btc_to_sats(best.coin["amount"])
+    d = best.difficulty
+    invdiff = best.maxdiff - d
+    csv = invdiff * best.delay
+    assert best.conf >= csv >= 0
+
+    if best.coin["scriptPubKey"] != best.tapinfo.scriptPubKey.hex():
+        logging.error("Best coin in wallet has wrong scriptPubKey (%s != %s)" % (best.coin["scriptPubKey"], best.tapinfo.scriptPubKey.hex()))
         return 1
 
     # claim coin
     claim_tx = CTransaction()
-    claim_tx.vin = [CTxIn(COutPoint(int(txid, 16), vout), nSequence=csv)]
+    claim_tx.vin = [CTxIn(COutPoint(int(best.txid, 16), best.vout), nSequence=csv)]
     claim_tx.wit.vtxinwit = [CTxInWitness()]
     claim_tx.vout = [CTxOut(amount, payto)]
     weight_before = claim_tx.get_weight()
 
     dust = 10000
+    extraweight = witness_weight(best.script, d, variant=best.variant)
     fee = math.ceil((weight_before + extraweight)/4 * feerate)
     if amount - fee < dust:
         logging.error("Fee too large ({fee} sats), remaining amount too small, failing")
         return 1
     claim_tx.vout[0].nValue -= fee
 
-    privkey = ECKey()
-    privkey.set(int(1).to_bytes(32, 'big'), compressed=True)
-    pubkey, _ = compute_xonly_pubkey(privkey.get_bytes())
-    signature_hash = TaprootSignatureHash(claim_tx, [CTxOut(amount, tapinfo.scriptPubKey)], SIGHASH_DEFAULT, 0, True, script)
-    signature = sign_schnorr(privkey.get_bytes(), signature_hash)
+    signature_hash = TaprootSignatureHash(claim_tx, [CTxOut(amount, best.tapinfo.scriptPubKey)], SIGHASH_DEFAULT, 0, True, best.script)
+    signature = sign_schnorr(CLAIM_PRIVKEY.get_bytes(), signature_hash)
 
     prefix = b'\x03\x00\x00\x00'
-    nbits = bytes(reversed([(280 - difficulty)//8, 0, 0, (1 << ((280 - difficulty) % 8))]))
-    logging.debug(f"nbits = {nbits.hex()} difficulty = {difficulty} csv = {csv} invdiff = {invdiff} delay = {delay}")
+    nbits = bytes(reversed([(280 - d)//8, 0, 0, (1 << ((280 - d) % 8))]))
+    logging.debug(f"nbits = {nbits.hex()} diff = {_fmt_diff(d)} (d={d}) amount = {amount/1e8} csv = {csv} invdiff = {invdiff} delay = {best.delay}")
 
-    args.bcli(f"-rpcwallet={args.wallet}", "lockunspent", 'false', json.dumps([dict(txid=txid, vout=vout)]))
+    if not future:
+        args.bcli(f"-rpcwallet={args.wallet}", "lockunspent", 'false', json.dumps([dict(txid=best.txid, vout=best.vout)]))
 
     noncezero = b'\x00\x00\x00\x00'
-    hashofsig = hashlib.sha256(signature).digest()
-    if not hashsig:
-        time = b'\x0b\x00\x00\x00'
-        fake_header = prefix + signature + time + nbits + noncezero
+    ntime = b'\x0b\x00\x00\x00'
+    if best.variant == 'legacy':
+        fake_header = prefix + signature + ntime + nbits + noncezero
+    elif best.variant == 'stratum_a':
+        cbhash = b''
+        prevpre = b''
+        prevhash = hashlib.sha256(prevpre).digest()
+        merkle_root = hash256(cbhash + hash256(signature))
+        fake_header = prefix + prevhash + merkle_root + ntime + nbits + noncezero
     else:
-        time = int(time.time()).to_bytes(4, 'little')
-        prevhash = bytes(32) # uint256{0}
-        fake_header = prefix + hashofsig + prevhash + time + nbits + noncezero
+        assert False, f"unknown variant {best.variant}"
     logging.debug(f"GRIND {fake_header.hex()}")
     grind = subprocess.run(args.grind.split(" ") + [fake_header.hex()], stdout=subprocess.PIPE, input=b"", check=True).stdout.strip().decode('utf8')
     logging.debug(f"GROUND {grind}")
 
     grind = bytes.fromhex(grind)
-    if not hashsig:
+    if best.variant == 'legacy':
         if grind[0] != 3 or grind[68] != 11 or grind[4:68] != signature or len(grind) != 80:
             logging.error("grind command changed too much")
             return 1
-    else:
-        if grind[0] != 3 or grind[4:36] != hashofsig or len(grind) != 80:
+        hdr_prefix = grind[1:4]
+        hdr_suffix = grind[69:]
+    elif best.variant == 'stratum_a':
+        if grind[4:36] != prevhash or grind[36:68] != merkle_root or len(grind) != 80:
             logging.error("grind command changed too much")
             return 1
-
-    prefix = grind[1:4]
-    suffix = grind[69:]
+        hdr_prefix = grind[0:4]
+        hdr_suffix = grind[68:]
+    else:
+        assert False, f"unknown variant {best.variant}"
 
     hashed = hash256(grind)
-    n = 32 - difficulty//8 - 1
+    n = 32 - d//8 - 1
     h_a, h_b = bytes([hashed[n]]), hashed[:n]
 
-    claim_tx.wit.vtxinwit[0].scriptWitness.stack = [
-        signature, pubkey,
-        prefix, suffix, h_b, h_a, bytes([difficulty]),
-        script,
-        bytes([0xc0 + tapinfo.negflag]) + ipk
-    ]
+    if best.variant == 'legacy':
+        claim_tx.wit.vtxinwit[0].scriptWitness.stack = [
+            signature, CLAIM_PUBKEY,
+            hdr_prefix, hdr_suffix, h_b, h_a, bytes([d]),
+            best.script,
+            bytes([0xc0 + best.tapinfo.negflag]) + best.ipk
+        ]
+    elif best.variant == 'stratum_a':
+        claim_tx.wit.vtxinwit[0].scriptWitness.stack = [
+            hdr_prefix, prevpre, hdr_suffix, cbhash, signature, CLAIM_PUBKEY,
+            h_b, h_a, bytes([d]),
+            best.script,
+            bytes([0xc0 + best.tapinfo.negflag]) + best.ipk
+        ]
+    else:
+        assert False, f"unknown variant {best.variant}"
     weight_after = claim_tx.get_weight()
-    # assert weight_after == weight_before + extraweight + difficulty//8
-    logging.debug(f"extra weight for {tapinfo.scriptPubKey.hex()}: {weight_after - weight_before} = {weight_after} - {weight_before} (expected {extraweight})")
+    logging.debug(f"witness weight for {best.tapinfo.scriptPubKey.hex()}: {weight_after - weight_before} (estimated {extraweight})")
     logging.debug(f"tx {claim_tx.serialize().hex()}")
-    sendtx(args, claim_tx)
+    if future:
+        claim_tx.rehash()
+        print(f"d: {d} ({_fmt_diff(d)}) csv={csv}")
+        blocks_until_valid = csv - best.coin["confirmations"]
+        if blocks_until_valid <= 0:
+            print(f"valid now")
+        else:
+            mins = blocks_until_valid * 10
+            print(f"valid in ~{blocks_until_valid} blocks (~{mins // 60}h{mins % 60:02d}m)")
+        print(f"txid: {claim_tx.hash}")
+        print(f"hex: {claim_tx.serialize().hex()}")
+    else:
+        sendtx(args, claim_tx)
     return 0
+
+# --- Server (fake bitcoind for ckpool) ---
+
+class PowcoinsState:
+    """Tracks the current best UTXO, signature, and work parameters.
+
+    Chain state is derived from the wallet rather than persisted:
+    the signet tip hash serves as prevhash (changes every block,
+    which naturally triggers new work when confirmations increase).
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.tapinfo = get_tapinfo(args)
+
+        # --- Shared state (accessed under self._lock) ---
+        self._lock = threading.Lock()
+
+        self._work_by_sig = {}     # sig_hex -> WorkItem
+
+        self._banked = {}              # (txid,vout) -> (d, tx_hex)
+        self._banked_spendable = {}    # (txid,vout) -> spendable_height
+        self._banked_retry_after = {}  # (txid,vout) -> (mono_time, tip_height)
+        self._banked_dirty = set()
+        self._work_dirty = set()       # sig_hex values needing DB sync
+        self._work_spent = set()       # (txid, vout) spent — delete from DB in sync
+        self._work_solved = set()      # sig_hex values already solved
+
+        self._hashrate_score = HASHRATE_DEFAULT * HASHRATE_HALF_LIFE / math.log(2)
+        self._hashrate_last_update = time.time()
+
+        # --- Snapshot (immutable, atomically replaced) ---
+        self.snapshot = WorkSnapshot(work=None, work_height=0, prevpre_hash=b'', tip_height=0)
+        self.work_event = threading.Event()
+
+        # --- Refresh-thread-only state ---
+        self._work_by_utxo = {}    # (txid, vout, d) -> WorkItem
+
+        self._tip_hash = None
+        self._tip_height = 0
+
+        self._coins = []
+        self._coin_metas = {}      # (txid, vout) -> CoinMeta
+        self._coins_updated = 0
+        self._last_job_key = None
+        self._schedule = []
+        self._schedule_idx = 0
+        self._work_height = 0
+        self._height_timestamps = {}
+        self._prevpre = b''
+        self._prevpre_hash = b''
+
+        # Hazard table (lagged tip H; see _update_hazard)
+        self._hazard_K = {}           # (dv_bin, r) -> float  competitor claims
+        self._hazard_E = {}           # (dv_bin, r) -> float  coin-block exposure
+        self._hazard_height = 0       # last fully accounted height H
+        self._our_claims = {}         # (txid, vout) -> claim_txid (broadcast by us)
+        self._pending_spends = {}     # (txid, vout) -> (CoinMeta, notice_height)
+        self._hazard_dirty = False
+        self._hazard_claims_dirty = False
+        self._hazard_pending_dirty = False
+
+        self.refresh_event = threading.Event()
+
+        # SQLite persistence (sets _work_height, _height_timestamps, loads banked)
+        self._init_db(args.db)
+
+    def _init_db(self, db_path):
+        self.db_path = db_path
+        db = sqlite3.connect(db_path)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("""CREATE TABLE IF NOT EXISTS banked (
+            txid TEXT NOT NULL,
+            vout INTEGER NOT NULL,
+            difficulty INTEGER NOT NULL,
+            tx_hex TEXT NOT NULL,
+            spendable_height INTEGER NOT NULL,
+            spent_height INTEGER,
+            PRIMARY KEY (txid, vout)
+        )""")
+        db.execute("""CREATE INDEX IF NOT EXISTS idx_banked_spendable
+            ON banked(spendable_height)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS height_timestamps (
+            height INTEGER PRIMARY KEY,
+            timemicros INTEGER NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS work_items (
+            sig_hex TEXT PRIMARY KEY,
+            txid TEXT NOT NULL,
+            vout INTEGER NOT NULL,
+            d INTEGER NOT NULL,
+            claim_amount INTEGER NOT NULL,
+            claim_spk BLOB NOT NULL,
+            csv INTEGER NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS hazard_data (
+            dv_bin INTEGER NOT NULL,
+            r INTEGER NOT NULL,
+            K REAL NOT NULL,
+            E REAL NOT NULL,
+            PRIMARY KEY (dv_bin, r)
+        )""")
+        # Drop pre-lag schema (had a per-row height column)
+        cols = [r[1] for r in db.execute("PRAGMA table_info(hazard_data)")]
+        if "height" in cols:
+            db.execute("DROP TABLE hazard_data")
+            db.execute("""CREATE TABLE hazard_data (
+                dv_bin INTEGER NOT NULL,
+                r INTEGER NOT NULL,
+                K REAL NOT NULL,
+                E REAL NOT NULL,
+                PRIMARY KEY (dv_bin, r)
+            )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS hazard_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            height INTEGER NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS hazard_claims (
+            txid TEXT NOT NULL,
+            vout INTEGER NOT NULL,
+            claim_txid TEXT NOT NULL,
+            PRIMARY KEY (txid, vout)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS hazard_pending (
+            txid TEXT NOT NULL,
+            vout INTEGER NOT NULL,
+            difficulty INTEGER NOT NULL,
+            logsats REAL NOT NULL,
+            delay INTEGER NOT NULL,
+            notice_height INTEGER NOT NULL,
+            PRIMARY KEY (txid, vout)
+        )""")
+        db.commit()
+
+        row = db.execute("SELECT MAX(height) FROM height_timestamps").fetchone()
+        if row[0] is not None:
+            self._work_height = row[0] + 1
+        else:
+            self._work_height = 1
+        for h, ts in db.execute("SELECT height, timemicros FROM height_timestamps"):
+            self._height_timestamps[h] = ts
+        self._update_prevpre()
+
+        for txid, vout, d, tx_hex, sh in db.execute(
+                "SELECT txid, vout, difficulty, tx_hex, spendable_height FROM banked"
+                " WHERE spent_height IS NULL"):
+            self._banked[(txid, vout)] = (d, tx_hex)
+            self._banked_spendable[(txid, vout)] = sh
+        for sig_hex, txid, vout, d, claim_amount, claim_spk, csv in db.execute(
+                "SELECT sig_hex, txid, vout, d, claim_amount, claim_spk, csv FROM work_items"):
+            work = WorkItem(sig=bytes.fromhex(sig_hex), difficulty=d,
+                            claim_amount=claim_amount, claim_spk=bytes(claim_spk),
+                            txid=txid, vout=vout, csv=csv)
+            self._work_by_sig[sig_hex] = work
+            self._work_by_utxo[(txid, vout, d)] = work
+        for dv_bin, r, K, E in db.execute("SELECT dv_bin, r, K, E FROM hazard_data"):
+            self._hazard_K[(dv_bin, r)] = K
+            self._hazard_E[(dv_bin, r)] = E
+        row = db.execute("SELECT height FROM hazard_state WHERE id = 1").fetchone()
+        if row is not None:
+            self._hazard_height = row[0]
+        for txid, vout, claim_txid in db.execute(
+                "SELECT txid, vout, claim_txid FROM hazard_claims"):
+            self._our_claims[(txid, vout)] = claim_txid
+        # pending restored after tapinfo is ready — need CoinMeta-like tuples
+        for txid, vout, difficulty, logsats, delay, notice_height in db.execute(
+                "SELECT txid, vout, difficulty, logsats, delay, notice_height "
+                "FROM hazard_pending"):
+            # Lightweight stand-in: only fields used by hazard recording
+            meta = CoinMeta(conf=0, txid=txid, vout=vout, coin=None,
+                            sats=0, logsats=logsats, delay=delay,
+                            mindiff=0, maxdiff=0, difficulty=difficulty,
+                            variant='', script=b'', tapinfo=None, ipk=b'')
+            self._pending_spends[(txid, vout)] = (meta, notice_height)
+        db.close()
+        logging.info("Loaded from db: work_height=%d, %d banked, %d work items, "
+                     "%d height timestamps, hazard_H=%d, %d claims, %d pending spends",
+                     self._work_height, len(self._banked), len(self._work_by_sig),
+                     len(self._height_timestamps), self._hazard_height,
+                     len(self._our_claims), len(self._pending_spends))
+        self.snapshot = WorkSnapshot(work=None, work_height=self._work_height,
+                                     prevpre_hash=self._prevpre_hash, tip_height=0)
+
+    # --- Shared state helpers (caller must hold self._lock) ---
+
+    def _update_hashrate(self, d):
+        now = time.time()
+        dt = now - self._hashrate_last_update
+        self._hashrate_score = self._hashrate_score * (0.5 ** (dt / HASHRATE_HALF_LIFE)) + 2.0 ** d
+        self._hashrate_last_update = now
+
+    @property
+    def _hashes_per_block(self):
+        now = time.time()
+        dt = now - self._hashrate_last_update
+        steps = int(dt // HASHRATE_STEP)
+        quantized_dt = steps * HASHRATE_STEP
+        score = self._hashrate_score * (0.5 ** (quantized_dt / HASHRATE_HALF_LIFE))
+        hashrate = score * math.log(2) / HASHRATE_HALF_LIFE
+        return hashrate * BLOCK_INTERVAL
+
+    def _publish_snapshot(self, work):
+        self.snapshot = WorkSnapshot(
+            work=work,
+            work_height=self._work_height,
+            prevpre_hash=self._prevpre_hash,
+            tip_height=self._tip_height,
+        )
+        if work is not None:
+            self.work_event.set()
+        else:
+            self.work_event.clear()
+
+    @staticmethod
+    def _hash_for_height(height):
+        prevpre = height.to_bytes(length=height.bit_length() // 8 + 1, byteorder='little')
+        return prevpre, hashlib.sha256(prevpre).digest()
+
+    def _update_prevpre(self):
+        self._prevpre, self._prevpre_hash = self._hash_for_height(self._work_height)
+
+    def _bump_work_height(self):
+        self._work_height += 1
+        self._height_timestamps[self._work_height] = int(time.time() * 1e6)
+        self._update_prevpre()
+
+    @synchronized
+    def startup(self):
+        """Initial tip fetch, UTXO load, and work generation."""
+        self._refresh_tip()
+        self._update_utxo_info(max_age=0)
+        self._schedule = self._build_quick_schedule()
+        if self._schedule:
+            self._apply_schedule()
+
+    def run_refresh_loop(self, interval=5):
+        """Background loop: refresh tip and work periodically."""
+        db = sqlite3.connect(self.db_path)
+        synced_height = self.snapshot.work_height - 1
+        while True:
+            try:
+                self.refresh_work()
+                synced_height = self.sync_db(db, synced_height)
+            except Exception as e:
+                logging.warning("refresh_work failed: %s", e)
+            self.refresh_event.wait(timeout=interval)
+            self.refresh_event.clear()
+
+    @synchronized
+    def sync_db(self, db, synced_height):
+        """Persist in-memory state to SQLite. Only called from refresh thread."""
+        dirty = False
+        for h in range(synced_height + 1, self._work_height + 1):
+            ts = self._height_timestamps.get(h)
+            if ts is not None:
+                db.execute("INSERT OR IGNORE INTO height_timestamps (height, timemicros) VALUES (?, ?)",
+                           (h, ts))
+                dirty = True
+        now_micros = int(time.time() * 1e6)
+        db.execute("DELETE FROM height_timestamps WHERE timemicros < ?",
+                   (now_micros - 3600 * 1_000_000,))
+        self._height_timestamps = {h: t for h, t in self._height_timestamps.items()
+                                   if t >= now_micros - 3600 * 1_000_000}
+        banked_dirty = self._banked_dirty
+        self._banked_dirty = set()
+        for outpoint in banked_dirty:
+            if outpoint in self._banked:
+                d, tx_hex = self._banked[outpoint]
+                sh = self._banked_spendable[outpoint]
+                db.execute(
+                    "INSERT OR REPLACE INTO banked (txid, vout, difficulty, tx_hex, spendable_height)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (outpoint[0], outpoint[1], d, tx_hex, sh))
+                dirty = True
+        for txid, vout in db.execute(
+                "SELECT txid, vout FROM banked WHERE spent_height IS NULL"):
+            if (txid, vout) not in self._banked and (txid, vout) not in self._banked_spendable:
+                db.execute("UPDATE banked SET spent_height = ? WHERE txid = ? AND vout = ?",
+                           (self._tip_height, txid, vout))
+                dirty = True
+        work_dirty = self._work_dirty
+        self._work_dirty = set()
+        for sig_hex in work_dirty:
+            work = self._work_by_sig.get(sig_hex)
+            if work is not None and sig_hex not in self._work_solved:
+                db.execute(
+                    "INSERT OR REPLACE INTO work_items (sig_hex, txid, vout, d, claim_amount, claim_spk, csv)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (sig_hex, work.txid, work.vout, work.difficulty, work.claim_amount,
+                     work.claim_spk, work.csv))
+                dirty = True
+        work_spent = self._work_spent
+        self._work_spent = set()
+        for txid, vout in work_spent:
+            db.execute("DELETE FROM work_items WHERE txid = ? AND vout = ?", (txid, vout))
+            dirty = True
+        if self._hazard_dirty:
+            db.execute("DELETE FROM hazard_data")
+            keys = set(self._hazard_K) | set(self._hazard_E)
+            for key in keys:
+                dv_bin, r = key
+                db.execute(
+                    "INSERT INTO hazard_data (dv_bin, r, K, E) VALUES (?, ?, ?, ?)",
+                    (dv_bin, r,
+                     self._hazard_K.get(key, 0.0),
+                     self._hazard_E.get(key, 0.0)))
+            db.execute("INSERT OR REPLACE INTO hazard_state (id, height) VALUES (1, ?)",
+                       (self._hazard_height,))
+            dirty = True
+        if self._hazard_claims_dirty:
+            db.execute("DELETE FROM hazard_claims")
+            for (txid, vout), claim_txid in self._our_claims.items():
+                db.execute(
+                    "INSERT INTO hazard_claims (txid, vout, claim_txid) VALUES (?, ?, ?)",
+                    (txid, vout, claim_txid))
+            dirty = True
+        if self._hazard_pending_dirty:
+            db.execute("DELETE FROM hazard_pending")
+            for (txid, vout), (meta, notice_height) in self._pending_spends.items():
+                db.execute(
+                    "INSERT INTO hazard_pending "
+                    "(txid, vout, difficulty, logsats, delay, notice_height) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (txid, vout, meta.difficulty, meta.logsats, meta.delay, notice_height))
+            dirty = True
+        if dirty:
+            db.commit()
+            self._hazard_dirty = False
+            self._hazard_claims_dirty = False
+            self._hazard_pending_dirty = False
+        return self._work_height
+
+    def _refresh_tip(self):
+        """Update signet tip from node. Returns True if tip changed."""
+        info = json.loads(self.args.bcli("getblockchaininfo"))
+        tip = info["bestblockhash"]
+        height = info["blocks"]
+        if tip == self._tip_hash:
+            return False
+        self._tip_hash = tip
+        self._tip_height = height
+        return True
+
+    def _check_banked(self):
+        """Broadcast any banked solutions that are now mature. Returns True if any were broadcast."""
+        broadcast = False
+        now = time.monotonic()
+        for outpoint, (d, tx_hex) in list(self._banked.items()):
+            sh = self._banked_spendable.get(outpoint)
+            if sh is None or sh > self._tip_height:
+                continue
+            retry_info = self._banked_retry_after.get(outpoint)
+            if retry_info is not None:
+                retry_time, retry_height = retry_info
+                if self._tip_height == retry_height and now < retry_time:
+                    continue
+            try:
+                self.args.bcli("sendrawtransaction", tx_hex)
+                logging.info("Broadcast banked solution: %s:%d d=%d",
+                             outpoint[0], outpoint[1], d)
+                self._note_our_claim(outpoint, self._txid_from_hex(tx_hex))
+                del self._banked[outpoint]
+                del self._banked_spendable[outpoint]
+                self._banked_retry_after.pop(outpoint, None)
+                broadcast = True
+            except Exception as e:
+                live = any(c["txid"] == outpoint[0] and c["vout"] == outpoint[1] for c in self._coins)
+                if not live:
+                    logging.warning("Dropping banked solution %s:%d d=%d — coin no longer unspent: %s",
+                                    outpoint[0], outpoint[1], d, e)
+                    del self._banked[outpoint]
+                    del self._banked_spendable[outpoint]
+                    self._banked_retry_after.pop(outpoint, None)
+                else:
+                    self._banked_retry_after[outpoint] = (now + 60, self._tip_height)
+                    logging.error("Failed to broadcast banked solution (retry in 60s): %s", e)
+        return broadcast
+
+    def _apply_schedule(self, t_refresh=None, allow_rebuild=True):
+        """Set current work from the top of the cached schedule. Returns True if work changed."""
+        while self._schedule_idx < len(self._schedule):
+            slot = self._schedule[self._schedule_idx]
+            coin, d = slot.coin, slot.d
+            outpoint = (coin.txid, coin.vout)
+            banked = self._banked.get(outpoint)
+            if banked is not None and d <= banked[0]:
+                self._schedule_idx += 1
+                continue
+            txout = self.args.bcli("gettxout", coin.txid, str(coin.vout))
+            if not txout.strip():
+                logging.info("Coin spent, skipping: %s:%d d=%d", coin.txid, coin.vout, d)
+                self._schedule_idx += 1
+                continue
+            job_key = (coin.txid, coin.vout, d)
+            if job_key == self._last_job_key:
+                return False
+            self._last_job_key = job_key
+            self._generate_work(coin, d, t_refresh=t_refresh)
+            return True
+        if allow_rebuild:
+            logging.info("Schedule exhausted, rebuilding quick schedule")
+            self._schedule = self._build_quick_schedule()
+            self._schedule_idx = 0
+            if self._schedule:
+                return self._apply_schedule(t_refresh=t_refresh, allow_rebuild=False)
+        self._publish_snapshot(None)
+        return False
+
+    def _advance_work(self):
+        """Advance past the current job in the cached schedule."""
+        self._schedule_idx += 1
+        self._apply_schedule()
+
+    @synchronized
+    def refresh_work(self):
+        """Check if work needs updating. Returns True if work changed."""
+        t0 = time.monotonic()
+        tip_changed = self._refresh_tip()
+        t_tip = time.monotonic()
+        self._update_utxo_info(max_age=0 if tip_changed else 30)
+        self._update_hazard()
+        t_utxo = time.monotonic()
+        banked_broadcast = self._check_banked()
+        if tip_changed or banked_broadcast:
+            self._bump_work_height()
+
+        full = self._build_schedule()
+        self._schedule = full
+        self._schedule_idx = 0
+        t_full = time.monotonic()
+        if not full:
+            logging.warning("No jobs available")
+            self._publish_snapshot(None)
+            return False
+
+        t = (t_tip - t0, t_utxo - t_tip, t_full - t_utxo)
+        if not self._apply_schedule(t_refresh=t):
+            logging.debug("refresh_work: no change (tip=%.3fs utxo=%.3fs sched=%.3fs)", *t)
+            return False
+        return True
+
+    def _update_utxo_info(self, max_age=30):
+        """Refresh cached coins from wallet if stale."""
+        now = time.time()
+        if now - self._coins_updated < max_age:
+            return
+        old_metas = self._coin_metas
+        coins_json = self.args.bcli(f"-rpcwallet={self.args.wallet}", "listunspent", "1")
+        all_coins = json.loads(coins_json)
+        self._coins = [c for c in all_coins if c["scriptPubKey"] in self.tapinfo and self.tapinfo[c["scriptPubKey"]][3] != 'legacy']
+        self._coin_metas = {(m.txid, m.vout): m for m in coins_meta(self.tapinfo, self._coins)}
+        self._coins_updated = now
+        live = {(c["txid"], c["vout"]) for c in self._coins}
+
+        # Track confirmed spends for deferred hazard K (finalized at hazard tip)
+        for outpoint, meta in old_metas.items():
+            if outpoint not in live and outpoint not in self._pending_spends:
+                self._pending_spends[outpoint] = (meta, self._tip_height)
+                self._hazard_pending_dirty = True
+        for outpoint in list(self._pending_spends):
+            if outpoint in live:
+                del self._pending_spends[outpoint]
+                self._hazard_pending_dirty = True
+
+        stale_utxo = [k for k in self._work_by_utxo if (k[0], k[1]) not in live]
+        for k in stale_utxo:
+            work = self._work_by_utxo.pop(k)
+            sig_hex = work.sig.hex()
+            self._work_by_sig.pop(sig_hex, None)
+            self._work_dirty.discard(sig_hex)
+            self._work_solved.discard(sig_hex)
+            self._work_spent.add((work.txid, work.vout))
+        stale_banked = [op for op in self._banked if op not in live]
+        for op in stale_banked:
+            logging.debug("Pruning banked solution %s:%d d=%d — coin spent",
+                          op[0], op[1], self._banked[op][0])
+            del self._banked[op]
+            self._banked_spendable.pop(op, None)
+            self._banked_dirty.discard(op)
+        logging.debug("Updated UTXO cache: %d stratum-compatible coins (of %d total), %d banked, %d stale work pruned, %d stale banked pruned",
+                      len(self._coins), len(all_coins), len(self._banked), len(stale_utxo), len(stale_banked))
+
+    @staticmethod
+    def _dv_bin(d, v):
+        """Integer bin for dv = d - v (log2 difficulty minus log2 sats)."""
+        return int(round(d - v))
+
+    @staticmethod
+    def _txid_from_hex(tx_hex):
+        tx = CTransaction()
+        tx.deserialize(BytesIO(bytes.fromhex(tx_hex)))
+        tx.rehash()
+        return tx.hash
+
+    def _note_our_claim(self, outpoint, claim_txid):
+        """Record a claim tx we broadcast (in-memory; refresh thread persists)."""
+        self._our_claims[outpoint] = str(claim_txid)
+        self._hazard_claims_dirty = True
+
+    def _is_our_confirmed_spend(self, outpoint, claim_txid):
+        """True if claim_txid is a confirmed wallet tx that spends outpoint."""
+        try:
+            tx = json.loads(self.args.bcli(
+                f"-rpcwallet={self.args.wallet}", "gettransaction", str(claim_txid)))
+        except Exception:
+            return False
+        if int(tx.get("confirmations") or 0) < 1:
+            return False
+        # Decode to check it spends this faucet outpoint
+        try:
+            raw = json.loads(self.args.bcli(
+                "decoderawtransaction", tx["hex"]))
+        except Exception:
+            return False
+        txid, vout = outpoint
+        for vin in raw.get("vin", []):
+            if vin.get("txid") == txid and vin.get("vout") == vout:
+                return True
+        return False
+
+    @staticmethod
+    def _hazard_prior(dv, r):
+        """Prior per-block hazard; used as K0/E0 when no empirical data exists."""
+        return min(math.log(2) * 2.0 ** (-dv - 1.6), -math.log(0.001)) / r
+
+    def _hazard(self, dv, r):
+        """Per-block probability a coin at dv = d - v is claimed by others.
+
+        h = (K + K0) / (E + E0) with K0 = E0 * prior(dv, r).
+        When K = E = 0 this equals the prior (old hardcoded formula).
+        """
+        key = (self._dv_bin(dv, 0), r)
+        K = self._hazard_K.get(key, 0.0)
+        E = self._hazard_E.get(key, 0.0)
+        K0 = HAZARD_E0 * self._hazard_prior(dv, r)
+        return (K + K0) / (E + HAZARD_E0)
+
+    def _decay_hazard(self, blocks):
+        """Apply exponential decay to all hazard counters for `blocks` steps."""
+        if blocks <= 0:
+            return
+        factor = 0.5 ** (blocks / HAZARD_DECAY_HALF_LIFE)
+        for key in list(self._hazard_K):
+            self._hazard_K[key] *= factor
+        for key in list(self._hazard_E):
+            self._hazard_E[key] *= factor
+        self._hazard_dirty = True
+
+    def _record_snipe(self, meta):
+        """Record a confirmed competitor claim."""
+        key = (self._dv_bin(meta.difficulty, meta.logsats), meta.delay)
+        self._hazard_K[key] = self._hazard_K.get(key, 0.0) + 1.0
+        self._hazard_dirty = True
+        logging.info("Competitor claim finalized: %s:%d dv=%d r=%d d=%d v=%.1f",
+                     meta.txid, meta.vout, key[0], key[1],
+                     meta.difficulty, meta.logsats)
+
+    def _finalize_pending_spends(self):
+        """Finalize pending spends whose notice height is covered by hazard tip H.
+
+        Notice at node tip T_notice; H advances only to T - N, so H >= notice
+        means T >= notice + N — at least N confirmations since we saw the spend.
+
+        A stored claim_txid counts as ours only if it is actually the confirmed
+        spender of the outpoint (evicted/replaced broadcasts do not suppress K).
+        """
+        done = []
+        for outpoint, (meta, notice_height) in self._pending_spends.items():
+            if self._hazard_height < notice_height:
+                continue
+            done.append(outpoint)
+            claim_txid = self._our_claims.get(outpoint)
+            if claim_txid is not None:
+                del self._our_claims[outpoint]
+                self._hazard_claims_dirty = True
+                if self._is_our_confirmed_spend(outpoint, claim_txid):
+                    continue
+                logging.info("Claim %s did not confirm for %s:%d; counting competitor",
+                             claim_txid, outpoint[0], outpoint[1])
+            self._record_snipe(meta)
+        if done:
+            for outpoint in done:
+                del self._pending_spends[outpoint]
+            self._hazard_pending_dirty = True
+
+    def _update_hazard(self):
+        """Advance lagged hazard tip H one block at a time toward T - N.
+
+        On reorg (H > T - N): clamp H down without rewinding K/E; decay
+        cleans up any bad samples over time.
+        """
+        T = self._tip_height
+        if T < HAZARD_CONFIRMATIONS:
+            return
+        target = T - HAZARD_CONFIRMATIONS
+        if self._hazard_height > target:
+            self._hazard_height = target
+            self._hazard_dirty = True
+            self._finalize_pending_spends()
+            return
+        if self._hazard_height == 0:
+            # First run: start at target; no fake historical exposure
+            self._hazard_height = target
+            self._hazard_dirty = True
+            self._finalize_pending_spends()
+            return
+
+        live_for_E = [m for op, m in self._coin_metas.items()
+                      if op not in self._pending_spends]
+        while self._hazard_height < target:
+            self._hazard_height += 1
+            self._decay_hazard(1)
+            self._finalize_pending_spends()
+            for m in live_for_E:
+                key = (self._dv_bin(m.difficulty, m.logsats), m.delay)
+                self._hazard_E[key] = self._hazard_E.get(key, 0.0) + 1.0
+            self._hazard_dirty = True
+
+    def _survival(self, v, d_now, d, t, r):
+        lam = t * self._hazard(d_now - v, r)
+        for dd in range(d + 1, d_now):
+            lam += r * self._hazard(dd - v, r)
+        return math.exp(-lam)
+
+    def _log_mv(self, v, d_now, d, t, r, d_best):
+        if d_best is not None and d <= d_best:
+            return float('-inf')
+        surv = self._survival(v, d_now, d, t, r)
+        if d_best is not None:
+            lam = sum(r * self._hazard(dd - v, r)
+                      for dd in range(d_best + 1, d))
+            dq = surv * -math.expm1(-lam)
+        else:
+            dq = surv
+        if dq <= 0:
+            return float('-inf')
+        return v - d + math.log2(dq)
+
+    def _maturity(self, d_now, d, t, r):
+        return t + r * (d_now - 1 - d)
+
+    @staticmethod
+    def _grind_budget(mus):
+        """Blocks needed for ~95% chance of solving all jobs back-to-back."""
+        return sum(mus) + 2.0 * sum(m * m for m in mus) ** 0.5
+
+    def _log_schedule_top(self, schedule, label):
+        if not schedule:
+            return
+        lines = []
+        for s in schedule[:10]:
+            c = s.coin
+            lines.append("%d/%d/%d/%d/%.1f" % (
+                s.d, s.deadline, c.delay, c.sats, s.logmv))
+        logging.debug("%s schedule top %d (d/dl/r/sats/logmv): %s",
+                      label, len(schedule), " ".join(lines))
+
+    def _build_quick_schedule(self):
+        """Fast approximate schedule: reuse persisted work, then fresh picks.
+
+        Pre-existing unsolved work items go first (already signed, one per
+        coin, sorted by deadline).  Coins without existing work get the
+        normal best-logMV scan, appended after, sorted by -logmv.
+        """
+        t0 = time.monotonic()
+        metas = coins_meta(self.tapinfo, self._coins)
+        cached = {}
+        for (txid, vout, d), work in self._work_by_utxo.items():
+            if work.sig.hex() not in self._work_solved:
+                cached.setdefault((txid, vout), []).append(d)
+        reuse = []
+        fresh = []
+        for coin in metas:
+            r = coin.delay
+            d_now = coin.difficulty
+            t = r - (coin.conf % r)
+            outpoint = (coin.txid, coin.vout)
+            banked = self._banked.get(outpoint)
+            d_best = banked[0] if banked else None
+            d_min = (d_best + 1) if d_best is not None else coin.mindiff
+            if d_min > d_now:
+                continue
+            cached_ds = cached.get(outpoint)
+            if cached_ds:
+                best_d, best_dl = None, float('inf')
+                for d in cached_ds:
+                    if d < d_min or d > d_now:
+                        continue
+                    dl = self._maturity(d_now, d, t, r)
+                    if dl >= -r and dl < best_dl:
+                        best_d, best_dl = d, dl
+                if best_d is not None:
+                    mv = self._log_mv(coin.logsats, d_now, best_d, t, r, d_best)
+                    reuse.append(ScheduleSlot(best_dl, coin, best_d, mv))
+                    continue
+            best_d, best_mv = None, float('-inf')
+            for d in range(d_min, d_now + 1):
+                mv = self._log_mv(coin.logsats, d_now, d, t, r, d_best)
+                if mv > best_mv:
+                    best_d, best_mv = d, mv
+            if best_mv == float('-inf'):
+                continue
+            deadline = self._maturity(d_now, best_d, t, r)
+            fresh.append(ScheduleSlot(deadline, coin, best_d, best_mv))
+        reuse.sort(key=lambda s: s.deadline)
+        fresh.sort(key=lambda s: -s.logmv)
+        schedule = reuse + fresh
+        logging.debug("_build_quick_schedule: %d coins, %d scheduled (%d reused, %.3fs)",
+                      len(metas), len(schedule), len(reuse), time.monotonic() - t0)
+        self._log_schedule_top(schedule, "quick")
+        return schedule
+
+    def _build_schedule(self):
+        t0 = time.monotonic()
+        metas = coins_meta(self.tapinfo, self._coins)
+        t1 = time.monotonic()
+        candidates = []
+        for coin in metas:
+            r = coin.delay
+            d_now = coin.difficulty
+            t = r - (coin.conf % r)
+            outpoint = (coin.txid, coin.vout)
+            banked = self._banked.get(outpoint)
+            d_best = banked[0] if banked else None
+            for d in range(coin.mindiff, d_now + 1):
+                mv = self._log_mv(coin.logsats, d_now, d, t, r, d_best)
+                if mv == float('-inf'):
+                    continue
+                deadline = self._maturity(d_now, d, t, r)
+                candidates.append(ScheduleSlot(deadline, coin, d, mv))
+        t2 = time.monotonic()
+        candidates.sort(key=lambda s: -s.logmv)
+        t3 = time.monotonic()
+
+        schedule = []
+        scheduled_coins = {}  # outpoint -> d currently scheduled
+        for slot in candidates:
+            outpoint = (slot.coin.txid, slot.coin.vout)
+            existing_d = scheduled_coins.get(outpoint)
+            if existing_d is not None and slot.d <= existing_d:
+                continue
+            if slot.deadline <= 0:
+                schedule.insert(0, slot)
+                break
+            if existing_d is not None:
+                schedule = [s for s in schedule if (s.coin.txid, s.coin.vout) != outpoint]
+            schedule.append(slot)
+            schedule.sort(key=lambda s: s.deadline)
+            scheduled_coins[outpoint] = slot.d
+            mus = []
+            has_slack = True
+            for s in schedule:
+                mus.append(2.0 ** s.d / self._hashes_per_block)
+                if s.deadline < self._grind_budget(mus):
+                    has_slack = False
+                    break
+            if not has_slack:
+                break
+        t4 = time.monotonic()
+        hpb = self._hashes_per_block
+        logging.debug("_build_schedule: %d coins, %d candidates, %d scheduled "
+                      "(meta=%.3fs cand=%.3fs sort=%.3fs sched=%.3fs hashrate=%.2fTH/s)",
+                      len(metas), len(candidates), len(schedule),
+                      t1 - t0, t2 - t1, t3 - t2, t4 - t3,
+                      hpb / BLOCK_INTERVAL / 1e12)
+        self._log_schedule_top(schedule, "full")
+        return schedule
+
+    def _generate_work(self, best, d, t_refresh=None):
+        """Generate signature and work parameters for a UTXO.
+
+        Pre-signs the claim transaction so the signature is fixed,
+        then derives the Stratum job parameters from it.  Reuses an
+        existing WorkItem if one already exists for this (utxo, d).
+        """
+        amount = btc_to_sats(best.coin["amount"])
+        invdiff = best.maxdiff - d
+        csv = invdiff * best.delay
+
+        utxo_key = (best.txid, best.vout, d)
+        existing = self._work_by_utxo.get(utxo_key)
+        if existing is not None and existing.sig.hex() in self._work_solved:
+            existing = None
+        if existing is None:
+            claim_spk = address_to_scriptpubkey(self.args.destination)
+
+            claim_tx = CTransaction()
+            claim_tx.vin = [CTxIn(COutPoint(int(best.txid, 16), best.vout), nSequence=csv)]
+            claim_tx.wit.vtxinwit = [CTxInWitness()]
+            claim_tx.vout = [CTxOut(amount, claim_spk)]
+
+            if self.args.feerate is not None:
+                feerate = int(self.args.feerate)
+            else:
+                try:
+                    x = json.loads(self.args.bcli("estimatesmartfee", "1", "conservative"))
+                    feerate = int(x["feerate"] * 1e5 * 1.1)
+                except Exception:
+                    feerate = 1
+
+            weight_before = claim_tx.get_weight()
+            extraweight = witness_weight(best.script, d, variant=best.variant, cbhash_len=32, prevpre_len=len(self._prevpre))
+            vbytes = (weight_before + extraweight) / 4
+            fee = math.ceil(vbytes * feerate)
+            if fee >= amount:
+                feerate = 0.2
+                fee = math.ceil(vbytes * feerate)
+                logging.warning("Fee too large for %d sat output, using %.1f sat/vb (%d sat fee)",
+                                amount, feerate, fee)
+            claim_tx.vout[0].nValue -= fee
+
+            signature_hash = TaprootSignatureHash(claim_tx, [CTxOut(amount, best.tapinfo.scriptPubKey)], SIGHASH_DEFAULT, 0, True, best.script)
+            sig = sign_schnorr(CLAIM_PRIVKEY.get_bytes(), signature_hash)
+
+            work = WorkItem(
+                sig=sig, difficulty=d, claim_amount=claim_tx.vout[0].nValue,
+                claim_spk=claim_spk, txid=best.txid, vout=best.vout, csv=csv,
+            )
+            self._work_by_sig[sig.hex()] = work
+            self._work_by_utxo[utxo_key] = work
+            self._work_dirty.add(sig.hex())
+            existing = work
+
+        self._publish_snapshot(existing)
+
+        timing = ""
+        if t_refresh is not None:
+            timing = " (tip=%.3fs utxo=%.3fs sched=%.3fs)" % t_refresh
+        logging.info("New work: utxo=%s:%d diff=%s (d=%d) amount=%s nbits=%s%s",
+                     best.txid, best.vout,
+                     _fmt_diff(d), d,
+                     amount / 1e8, _d_to_nbits(d), timing)
+
+    def build_gbt_response(self, req_id=None):
+        """Construct a fake getblocktemplate response.
+
+        This is what ckpool parses in gen_gbtbase() to create workbases.
+        """
+        snap = self.snapshot
+        work = snap.work
+        if work is None:
+            self.work_event.wait(timeout=1)
+            snap = self.snapshot
+            work = snap.work
+            if work is None:
+                return {"error": {"code": -1, "message": "No UTXOs available"}, "id": req_id}
+
+        sig_hash = hash256(work.sig)[::-1].hex()
+
+        result = {
+            "previousblockhash": snap.prevpre_hash[::-1].hex(),
+            "target": _d_to_target(work.difficulty),
+            "version": 0x20000000,
+            "curtime": int(time.time()),
+            "bits": _d_to_nbits(work.difficulty),
+            "height": snap.work_height,
+            "coinbasevalue": work.claim_amount,
+            "coinbaseaux": {"flags": ""},
+            "transactions": [
+                {
+                    "txid": sig_hash,
+                    "hash": sig_hash,
+                    "data": work.sig.hex(),
+                }
+            ],
+            "rules": [],
+        }
+
+        return {"result": result, "error": None, "id": req_id}
+
+    def get_prevhash(self):
+        return self.snapshot.prevpre_hash[::-1].hex()
+
+    @synchronized
+    def handle_submit(self, block_hex):
+        """Handle a solved 'block' from ckpool.
+
+        Block format: header(80B) + varint(02) + coinbase + sig(64B)
+
+        Returns (success: bool, message: str).
+        """
+        if len(block_hex) < 164:
+            return False, "Block data too short"
+
+        header_bin = bytes.fromhex(block_hex[:160])
+        if block_hex[160:162] != "02":
+            return False, f"Expected 2 transactions, got varint {block_hex[160:162]}"
+
+        sig_hex = block_hex[-128:]
+        coinbase_hex = block_hex[162:-128]
+        coinbase_bin = bytes.fromhex(coinbase_hex)
+
+        work = self._work_by_sig.get(sig_hex)
+        if work is None:
+            return False, f"Unknown signature {sig_hex[:32]}..."
+
+        # Verify PoW: need d trailing zero bits
+        pow_hash = hash256(header_bin)
+        n = 32 - work.difficulty // 8 - 1
+        partial = work.difficulty % 8
+        threshold = (1 << (8 - partial)) if partial else 256
+        if pow_hash[n + 1:] != b'\x00' * (32 - n - 1) or pow_hash[n] >= threshold:
+            return False, "Insufficient proof of work"
+
+        # Look up coin metadata from tapinfo
+        coin = next((c for c in self._coins if c["txid"] == work.txid and c["vout"] == work.vout), None)
+        if coin is None:
+            return False, f"Coin {work.txid}:{work.vout} no longer in UTXO set"
+        spk = coin["scriptPubKey"]
+        if spk not in self.tapinfo:
+            return False, f"Unknown scriptPubKey for {work.txid}:{work.vout}"
+        _, _, _, variant, script, ti, ipk, _ = self.tapinfo[spk]
+
+        # Reconstruct claim tx
+        claim_tx = CTransaction()
+        claim_tx.vin = [CTxIn(COutPoint(int(work.txid, 16), work.vout), nSequence=work.csv)]
+        claim_tx.wit.vtxinwit = [CTxInWitness()]
+        claim_tx.vout = [CTxOut(work.claim_amount, work.claim_spk)]
+
+        hdr_prefix = header_bin[0:4]
+        hdr_suffix = header_bin[68:80]
+        cbhash = hash256(coinbase_bin)
+        h_a = bytes([pow_hash[n]])
+        h_b = pow_hash[:n]
+
+        if variant == 'stratum_a':
+            height = int.from_bytes(coinbase_bin[-4:], 'little') + 1
+            prevpre, prevhash = self._hash_for_height(height)
+            if prevhash != header_bin[4:36]:
+                return False, f"prevhash mismatch: height {height} gives {prevhash[::-1].hex()}, header has {header_bin[4:36][::-1].hex()}"
+            claim_tx.wit.vtxinwit[0].scriptWitness.stack = [
+                hdr_prefix, prevpre, hdr_suffix, cbhash, work.sig, CLAIM_PUBKEY,
+                h_b, h_a, bytes([work.difficulty]),
+                script,
+                bytes([0xc0 + ti.negflag]) + ipk,
+            ]
+        else:
+            assert False, f"server doesn't support variant {variant}"
+
+        claim_tx.rehash()
+        logging.info("Claim tx for %s:%d diff=%s pow=%s txid=%s",
+                     work.txid, work.vout,
+                     _fmt_diff(work.difficulty),
+                     pow_hash[::-1].hex(),
+                     claim_tx.hash)
+
+        if self.args.dry_run:
+            logging.info("Dry run, not broadcasting: %s", claim_tx.serialize().hex())
+            return True, None
+
+        self._update_hashrate(work.difficulty)
+
+        outpoint = (work.txid, work.vout)
+        confirmed_height = self._tip_height - coin["confirmations"] + 1
+        spendable_height = confirmed_height + work.csv
+
+        if spendable_height > self._tip_height:
+            tx_hex = claim_tx.serialize().hex()
+            self._banked[outpoint] = (work.difficulty, tx_hex)
+            self._banked_spendable[outpoint] = spendable_height
+            self._banked_dirty.add(outpoint)
+            logging.info("Banked solution (spendable at height %d, now %d): %s:%d d=%d",
+                         spendable_height, self._tip_height, work.txid, work.vout, work.difficulty)
+        else:
+            try:
+                tx_hex = claim_tx.serialize().hex()
+                self.args.bcli("sendrawtransaction", tx_hex)
+                logging.info("Broadcast claim tx: %s:%d d=%d", work.txid, work.vout, work.difficulty)
+                self._note_our_claim(outpoint, claim_tx.hash)
+            except Exception as e:
+                logging.error("Failed to broadcast claim tx: %s", e)
+                return False, str(e)
+
+        self._work_solved.add(work.sig.hex())
+        self._bump_work_height()
+        self._advance_work()
+        return True, None
+
+
+class JsonRpcHandler(BaseHTTPRequestHandler):
+    """Bitcoind-compatible JSON-RPC handler for ckpool integration.
+
+    Architecture:
+      [ASIC miner] <--Stratum v1--> [ckpool] <--JSON-RPC--> [this] <--bitcoin-cli--> [signet node]
+    """
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode()
+
+        auth_header = self.headers.get("Authorization", "")
+        if not self._check_auth(auth_header):
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        try:
+            request = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        method = request.get("method", "")
+        params = request.get("params", [])
+        req_id = request.get("id", None)
+        quiet = method in ("getbestblockhash", "getblockcount")
+
+        if not quiet:
+            logging.debug("RPC request: %s", body)
+
+        response = self._dispatch(method, params, req_id)
+        response_body = json.dumps(response).encode() + b"\n"
+        if not quiet:
+            logging.debug("RPC response: %s", response_body)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def _check_auth(self, auth_header):
+        if not auth_header.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode()
+            user, password = decoded.split(":", 1)
+            return (user == self.server.rpc_user and
+                    password == self.server.rpc_password)
+        except Exception:
+            return False
+
+    def _dispatch(self, method, params, req_id):
+        state = self.server.powcoins_state
+
+        if method == "getblocktemplate":
+            return state.build_gbt_response(req_id)
+
+        elif method == "getbestblockhash":
+            return {"result": state.get_prevhash(), "error": None, "id": req_id}
+
+        elif method == "getblockcount":
+            return {"result": state.snapshot.work_height, "error": None, "id": req_id}
+
+        elif method == "getblockhash":
+            snap = state.snapshot
+            height = params[0] if params else 0
+            if height <= snap.work_height:
+                _, h = PowcoinsState._hash_for_height(height)
+                return {"result": h[::-1].hex(), "error": None, "id": req_id}
+            return {"result": snap.prevpre_hash[::-1].hex(), "error": None, "id": req_id}
+
+        elif method == "submitblock":
+            block_hex = params[0] if params else ""
+            success, errmsg = state.handle_submit(block_hex)
+            result = None if success else errmsg
+            return {"result": result, "error": None, "id": req_id}
+
+        elif method == "preciousblock":
+            return {"result": None, "error": None, "id": req_id}
+
+        elif method in ("validateaddress", "decoderawtransaction"):
+            try:
+                result = json.loads(state.args.bcli(method, *params))
+                return {"result": result, "error": None, "id": req_id}
+            except Exception as e:
+                return {"result": None, "error": {"code": -1, "message": str(e)}, "id": req_id}
+
+        else:
+            logging.warning("Unhandled RPC method: %s", method)
+            return {
+                "result": None,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+                "id": req_id,
+            }
+
+    @classmethod
+    def run(cls, args):
+        state = PowcoinsState(args)
+
+        try:
+            state.startup()
+        except Exception as e:
+            logging.error("Failed to initialize: %s", e)
+            logging.error("Is the signet node running with the powcoins wallet loaded?")
+            return 1
+
+        t = threading.Thread(target=state.run_refresh_loop, daemon=True)
+        t.start()
+
+        server = ThreadingHTTPServer((args.host, args.port), cls)
+        server.powcoins_state = state
+        server.rpc_user = args.rpc_user
+        server.rpc_password = args.rpc_password
+
+        logging.info("Powcoins template server listening on %s:%d", args.host, args.port)
+        logging.info("Configure ckpool with: \"btcd\": [{\"url\": \"%s:%d\", "
+                     "\"auth\": \"%s\", \"pass\": \"%s\"}]",
+                     args.host, args.port, args.rpc_user, args.rpc_password)
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logging.info("Shutting down")
+            server.shutdown()
+
+        return 0
+
 
 def bitcoin_cli(basecmd, args, **kwargs):
     cmd = basecmd + args
@@ -286,16 +1612,38 @@ def main(argv):
     claim.add_argument("--grind", default="bitcoin-util grind", help="Command line for grinding a header")
     claim.add_argument("--max-difficulty", default=26, type=int, help="Maximum difficulty to attempt")
     claim.add_argument("--feerate", default=None, type=int, help="Feerate to use (sats/vb)")
+    claim.add_argument("--future", default=0, type=int, help="Pretend N extra blocks confirmed (dry run: print tx, don't relay)")
     claim.add_argument("address", help="Address to receive funds")
+
+    info = cmds.add_parser("info", help="Show known faucet addresses and parameters")
+    info.set_defaults(fn=do_info)
+    info.add_argument("--cli", default="bitcoin-cli -signet", help="Command line for bitcoin-cli")
 
     setupwallet = cmds.add_parser("setup-wallet", help="Setup wallet to track PoW faucet")
     setupwallet.set_defaults(fn=do_setupwallet)
     setupwallet.add_argument("--wallet", default="powcoins", help="Name of wallet used for tracking faucet coins")
     setupwallet.add_argument("--cli", default="bitcoin-cli -signet", help="Command line for bitcoin-cli")
 
+    srv = cmds.add_parser("server", help="Run fake bitcoind for ckpool (Stratum mining)")
+    srv.set_defaults(fn=JsonRpcHandler.run)
+    srv.add_argument("--wallet", default="powcoins", help="Name of wallet used for tracking faucet coins")
+    srv.add_argument("--cli", default="bitcoin-cli -signet", help="Command line for bitcoin-cli")
+    srv.add_argument("--port", type=int, default=18332, help="Port to listen on (default: 18332)")
+    srv.add_argument("--host", default="127.0.0.1", help="Address to bind to (default: 127.0.0.1)")
+    srv.add_argument("--rpc-user", default="powcoins", help="RPC username for ckpool auth")
+    srv.add_argument("--rpc-password", default="powcoins", help="RPC password for ckpool auth")
+    srv.add_argument("--feerate", default=None, type=int, help="Feerate to use (sats/vb)")
+    srv.add_argument("--dry-run", action="store_true", help="Log claim txs but don't broadcast")
+    srv.add_argument("--db", default="powcoins.db", help="SQLite database path (default: powcoins.db)")
+    srv.add_argument("destination", help="Address to send claimed coins to")
+
     args = parser.parse_args(argv)
 
     args.bcli = lambda *a, input=b"", **kwargs: bitcoin_cli(args.cli.split(" "), list(a), input=input, **kwargs)
+
+    logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%SZ")
+    logging.Formatter.converter = time.gmtime
 
     if args.debug and args.quiet:
         logging.error("Can only specify one of --debug and --quiet")
