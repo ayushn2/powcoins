@@ -1,0 +1,1044 @@
+#!/usr/bin/env python3
+"""Pool payout service for ckpool miners.
+
+Watches a wallet for incoming coins (block rewards or powcoins claims),
+matches each to a solving share in ckpool's sharelogs, and distributes
+rewards to miners using a carryover geometric score model with
+work-clock decay.
+
+See pooled-payouts-carryover-geometric-spec.md for the full design.
+"""
+
+import argparse
+import bisect
+import collections
+from decimal import Decimal
+import hashlib
+import json
+import logging
+import math
+import os
+import sqlite3
+import struct
+import subprocess
+import time
+
+# -- Parameters ---------------------------------------------------------------
+
+MINDIFF = 0.1                 # work counter quantization (default)
+SETTLE_DEPTH_POWCOINS = 12
+SETTLE_DEPTH_COINBASE = 100
+MARGIN_FRACTION = 0.02        # 2% pool margin
+DUST_THRESHOLD = 1000         # sats; sub-threshold goes to lottery
+MIN_PAYOUT_VALUE = 10_000_000 # sats (0.1 BTC); defer payout if total settled below this
+FEE_RATE = 1                  # sat/vB; None to use wallet fee estimation
+WORKSTAMP_EPOCH_THRESHOLD = 2**62
+WORKSTAMP_EPOCH_ADJUSTMENT = 2**61
+L_OVER_MINDIFF_LIMIT = 2**57
+
+# -- Helpers ------------------------------------------------------------------
+
+STDIN_THRESHOLD = 500  # bytes; arguments larger than this go via -stdin
+
+def bitcoin_cli(basecmd, args, **kwargs):
+    # Move large arguments to stdin to avoid E2BIG
+    if any(len(a) > STDIN_THRESHOLD for a in args):
+        # Find the first large arg — it and everything after go to stdin
+        split = next(i for i, a in enumerate(args) if len(a) > STDIN_THRESHOLD)
+        cmd = basecmd + ["-stdin"] + args[:split]
+        stdin_data = "\n".join(args[split:]) + "\n"
+        kwargs["input"] = stdin_data.encode()
+    else:
+        cmd = basecmd + args
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, **kwargs, check=True).stdout
+    if isinstance(out, bytes):
+        out = out.decode('utf8')
+    return out.strip()
+
+def btc_to_sats(btc):
+    """Convert BTC (float or string) to satoshis without float truncation."""
+    return int(Decimal(str(btc)).quantize(Decimal('1e-8')) * Decimal('100000000'))
+
+def sha256(data):
+    return hashlib.sha256(data).digest()
+
+def hash256(data):
+    return sha256(sha256(data))
+
+def bcli_json(bcli, *args):
+    return json.loads(bcli(*args))
+
+def nbits_to_ndiff(nbits):
+    """Convert compact target (nbits) to network difficulty."""
+    exponent = (nbits >> 24) & 0xff
+    mantissa = nbits & 0x7fffff
+    if exponent <= 3:
+        target = mantissa >> (8 * (3 - exponent))
+    else:
+        target = mantissa << (8 * (exponent - 3))
+    if target <= 0:
+        return float('inf')
+    return (0xFFFF << 208) / target
+
+def load_workinfo_cache(logs_dir):
+    """Build filename_stem → (ndiff, reward) cache from workinfo files.
+
+    Each sharelog file shares a filename stem with its workinfo file,
+    so we key the cache by stem (e.g. '6a319d3c000032fb').
+    """
+    cache = {}
+    for height_dir in os.listdir(logs_dir):
+        dirpath = os.path.join(logs_dir, height_dir)
+        if not os.path.isdir(dirpath):
+            continue
+        for fname in os.listdir(dirpath):
+            if not fname.endswith('.workinfo'):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            with open(fpath) as f:
+                info = json.loads(f.readline())
+            nbits = int(info["bits"], 16)
+            stem = fname[:-len('.workinfo')]
+            cache[stem] = (nbits_to_ndiff(nbits), info.get("reward"))
+    return cache
+
+# -- Database -----------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS workers (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    address TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS scores (
+    worker_id   INTEGER PRIMARY KEY REFERENCES workers(id),
+    score       REAL NOT NULL,
+    workstamp   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS work_state (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    work_counter    INTEGER NOT NULL,
+    mindiff         REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS epoch_L (
+    workstamp               INTEGER PRIMARY KEY,
+    L                       REAL NOT NULL,
+    cumulative_log_decay    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS solves (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash        TEXT UNIQUE NOT NULL,
+    createdate  REAL NOT NULL,
+    worker_id   INTEGER NOT NULL REFERENCES workers(id),
+    workinfoid  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS candidate_payouts (
+    solve_id    INTEGER NOT NULL REFERENCES solves(id),
+    worker_id   INTEGER NOT NULL REFERENCES workers(id),
+    score       REAL NOT NULL,
+    PRIMARY KEY (solve_id, worker_id)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    coin_txid           TEXT NOT NULL,
+    coin_vout           INTEGER NOT NULL,
+    coin_amount         INTEGER NOT NULL,
+    payment_txid        TEXT,
+    solve_id            INTEGER NOT NULL REFERENCES solves(id),
+    total_score         REAL NOT NULL,
+    total_distributed   INTEGER NOT NULL,
+    timestamp           INTEGER NOT NULL,
+    UNIQUE (coin_txid, coin_vout)
+);
+
+CREATE TABLE IF NOT EXISTS payment_details (
+    payment_id  INTEGER NOT NULL REFERENCES payments(id),
+    worker_id   INTEGER NOT NULL REFERENCES workers(id),
+    amount      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_details_payment ON payment_details(payment_id);
+CREATE INDEX IF NOT EXISTS idx_payment_details_worker ON payment_details(worker_id);
+
+CREATE TABLE IF NOT EXISTS unmatched_coins (
+    txid        TEXT NOT NULL,
+    vout        INTEGER NOT NULL,
+    amount_sats INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    timestamp   INTEGER NOT NULL,
+    PRIMARY KEY (txid, vout)
+);
+
+CREATE TABLE IF NOT EXISTS import_state (
+    logfile     TEXT PRIMARY KEY,
+    line_count  INTEGER NOT NULL,
+    mtime       REAL NOT NULL,
+    size        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS param_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    date    TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    old     TEXT,
+    new     TEXT NOT NULL,
+    note    TEXT
+);
+"""
+
+def get_worker_id(con, address):
+    row = con.execute("SELECT id FROM workers WHERE address = ?", (address,)).fetchone()
+    if row:
+        return row[0]
+    con.execute("INSERT INTO workers (address) VALUES (?)", (address,))
+    return con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+def extract_worker_address(workername):
+    """Extract the bitcoin address from a ckpool workername.
+
+    ckpool's Stratum user field is 'address.workername' — the part after
+    the first dot is the miner/worker label and must be stripped before
+    using the string as a payout address.
+    """
+    addr = workername.split(".")[0]
+    return addr
+
+_valid_address_cache = {}  # address -> bool
+
+def validate_worker_address(bcli, addr):
+    """Check whether addr is a valid bitcoin address (cached).
+
+    Caches both valid and invalid results from successful RPC calls.
+    RPC failures (timeouts, connection errors) are not cached so they
+    get retried next call.
+    """
+    cached = _valid_address_cache.get(addr)
+    if cached is not None:
+        return cached
+    try:
+        info = json.loads(bcli("validateaddress", addr))
+        valid = info.get("isvalid", False)
+    except Exception:
+        logging.debug("validateaddress RPC failed for %s, will retry", addr)
+        return False
+    _valid_address_cache[addr] = valid
+    return valid
+
+def init_db(db_path, L, mindiff):
+    db = sqlite3.connect(db_path)
+    db.executescript(SCHEMA)
+    if not db.execute("SELECT 1 FROM work_state WHERE id = 1").fetchone():
+        if L is None:
+            raise ValueError("--L required when creating a new database")
+        db.execute("INSERT INTO work_state (id, work_counter, mindiff) VALUES (1, 0, ?)",
+                   (mindiff,))
+        db.execute("INSERT INTO epoch_L (workstamp, L, cumulative_log_decay) VALUES (0, ?, 0.0)",
+                   (L,))
+        db.commit()
+    return db
+
+# -- Score management ---------------------------------------------------------
+
+def decay(score, delta_workstamp, L, mindiff):
+    if delta_workstamp <= 0:
+        return score
+    return score * math.exp(-delta_workstamp * mindiff / L)
+
+def cumulative_log_decay_at(cur, workstamp, mindiff):
+    """Cumulative log-decay from epoch origin to workstamp, via epoch_L segments."""
+    row = cur.execute(
+        "SELECT workstamp, L, cumulative_log_decay FROM epoch_L "
+        "WHERE workstamp <= ? ORDER BY workstamp DESC LIMIT 1",
+        (workstamp,)).fetchone()
+    if row is None:
+        row = cur.execute(
+            "SELECT workstamp, L, cumulative_log_decay FROM epoch_L "
+            "ORDER BY workstamp ASC LIMIT 1").fetchone()
+    ws, L, cld = row
+    return cld + (workstamp - ws) * mindiff / L
+
+def decay_between(cur, score, t, T, mindiff):
+    """Decay score from workstamp t to T across epoch_L segments."""
+    if T <= t:
+        return score
+    return score * math.exp(-(cumulative_log_decay_at(cur, T, mindiff)
+                              - cumulative_log_decay_at(cur, t, mindiff)))
+
+def get_work_counter(db):
+    return db.execute("SELECT work_counter FROM work_state WHERE id = 1").fetchone()[0]
+
+def get_current_L(db):
+    row = db.execute(
+        "SELECT L FROM epoch_L ORDER BY workstamp DESC LIMIT 1").fetchone()
+    if row is None:
+        raise RuntimeError("No L configured in epoch_L table")
+    return row[0]
+
+def get_mindiff(db):
+    return db.execute("SELECT mindiff FROM work_state WHERE id = 1").fetchone()[0]
+
+def update_score(cur, worker_id, work_counter, diff, mindiff):
+    row = cur.execute(
+        "SELECT score, workstamp FROM scores WHERE worker_id = ?",
+        (worker_id,)).fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO scores (worker_id, score, workstamp) VALUES (?, ?, ?)",
+            (worker_id, diff, work_counter))
+    else:
+        old_score, old_workstamp = row
+        new_score = decay_between(cur, old_score, old_workstamp, work_counter, mindiff) + diff
+        cur.execute(
+            "UPDATE scores SET score = ?, workstamp = ? WHERE worker_id = ?",
+            (new_score, work_counter, worker_id))
+
+def record_candidate_payout(cur, solve_id, work_counter, mindiff):
+    rows = cur.execute("SELECT worker_id, score, workstamp FROM scores").fetchall()
+    for worker_id, score, workstamp in rows:
+        snap_score = decay_between(cur, score, workstamp, work_counter, mindiff)
+        if snap_score < 1e-10:
+            continue
+        cur.execute(
+            "INSERT INTO candidate_payouts (solve_id, worker_id, score) "
+            "VALUES (?, ?, ?)", (solve_id, worker_id, snap_score))
+
+# -- Sharelog import + score folding ------------------------------------------
+
+def read_new_shares(logs_dir, db):
+    """Read new sharelog lines from disk. Returns list of share dicts."""
+    cur = db.cursor()
+    known = {}
+    for row in cur.execute("SELECT logfile, line_count, mtime, size FROM import_state"):
+        known[row[0]] = (row[1], row[2], row[3])
+
+    new_shares = []
+    file_updates = {}
+
+    for height_dir in sorted(os.listdir(logs_dir)):
+        dirpath = os.path.join(logs_dir, height_dir)
+        if not os.path.isdir(dirpath):
+            continue
+        for fname in sorted(os.listdir(dirpath)):
+            if not fname.endswith('.sharelog'):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            rel = os.path.relpath(fpath, logs_dir)
+
+            st = os.stat(fpath)
+            mtime, size = st.st_mtime, st.st_size
+            prev_count, prev_mtime, prev_size = known.get(rel, (0, 0, 0))
+            if mtime == prev_mtime and size == prev_size:
+                continue
+
+            with open(fpath) as f:
+                lines = f.readlines()
+
+            for line in lines[prev_count:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    share = json.loads(line)
+                    cd = share["createdate"]
+                    if isinstance(cd, str):
+                        parts = cd.split(",")
+                        sec, nsec = int(parts[0]), int(parts[1])
+                    else:
+                        sec, nsec = int(cd), 0
+                    diff = float(share["diff"])
+                    sdiff = float(share["sdiff"])
+                    new_shares.append({
+                        "createdate_sec": sec,
+                        "createdate_nsec": nsec,
+                        "workinfoid": share["workinfoid"],
+                        "worker": str(share["workername"]),
+                        "diff": diff,
+                        "sdiff": sdiff,
+                        "hash": str(share["hash"]),
+                        "errn": int(share.get("errn", 0)),
+                        "logfile": rel,
+                    })
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError) as e:
+                    logging.warning("Skipping malformed share in %s: %s", rel, e)
+                    continue
+            file_updates[rel] = (len(lines), mtime, size)
+
+    return new_shares, file_updates
+
+def import_sharelogs(db, logs_dir, mindiff):
+    """Import new shares, fold into scores, record candidate payouts at solves."""
+    new_shares, file_updates = read_new_shares(logs_dir, db)
+    if not new_shares:
+        logging.info("No new shares to import")
+        return 0
+
+    new_shares.sort(key=lambda s: (s["createdate_sec"], s["createdate_nsec"]))
+
+    workinfo_cache = load_workinfo_cache(logs_dir)
+
+    cur = db.cursor()
+    known_hashes = set(r[0] for r in cur.execute("SELECT hash FROM solves"))
+    T = get_work_counter(db)
+
+    worker_id_cache = {}
+    solve_count = 0
+    for share in new_shares:
+        share_time = share["createdate_sec"] + share["createdate_nsec"] / 1e9
+
+        addr = extract_worker_address(share["worker"])
+        wid = worker_id_cache.get(addr)
+        if wid is None:
+            wid = get_worker_id(cur, addr)
+            worker_id_cache[addr] = wid
+
+        stem = os.path.basename(share["logfile"])[:-len('.sharelog')]
+        wi = workinfo_cache.get(stem)
+        ndiff = wi[0] if wi else None
+        if (ndiff is not None
+                and share["sdiff"] >= ndiff
+                and share["hash"] not in known_hashes):
+            cur.execute(
+                "INSERT INTO solves (hash, createdate, worker_id, workinfoid) "
+                "VALUES (?, ?, ?, ?)",
+                (share["hash"], share_time, wid, share["workinfoid"]))
+            solve_id = cur.lastrowid
+            record_candidate_payout(cur, solve_id, T, mindiff)
+            known_hashes.add(share["hash"])
+            solve_count += 1
+
+        if share["errn"] != 0:
+            continue
+
+        increment = int(share["diff"] / mindiff)
+        if increment > 0:
+            T += increment
+
+        update_score(cur, wid, T, share["diff"], mindiff)
+
+    cur.execute("UPDATE work_state SET work_counter = ? WHERE id = 1", (T,))
+
+    for rel, (count, mtime, size) in file_updates.items():
+        cur.execute(
+            "INSERT OR REPLACE INTO import_state (logfile, line_count, mtime, size) "
+            "VALUES (?, ?, ?, ?)", (rel, count, mtime, size))
+
+    db.commit()
+
+    worker_count = cur.execute("SELECT COUNT(*) FROM scores").fetchone()[0]
+    logging.info("Imported %d shares (%d solves), %d workers, T=%d",
+                 len(new_shares), solve_count, worker_count, T)
+    return len(new_shares)
+
+# -- Solve hash extraction ----------------------------------------------------
+
+def solve_hash_from_blockhash(blockhash_hex):
+    return blockhash_hex
+
+def solve_hash_from_powcoins_witness(witness):
+    """Extract the solve hash from a powcoins claim tx's witness data.
+
+    stratum_a: [prefix(4B), prevpre, suffix, cbhash, sig, pubkey, h_b, h_a, diff, script, control]
+    """
+    prefix = bytes.fromhex(witness[0])
+    if len(prefix) == 4:
+        h_b_idx, h_a_idx, d_idx = 6, 7, 8
+    else:
+        raise ValueError(f"Unrecognized prefix length {len(prefix)}")
+
+    h_b = bytes.fromhex(witness[h_b_idx])
+    h_a = bytes.fromhex(witness[h_a_idx])
+    d = int(witness[d_idx], 16)
+    n = 32 - d // 8 - 1
+    pow_hash = h_b + h_a + b'\x00' * (32 - n - 1)
+    return pow_hash[::-1].hex()
+
+# -- Solve matching -----------------------------------------------------------
+
+def find_solve_in_db(db, solve_hash):
+    row = db.execute(
+        "SELECT s.id, s.createdate, w.address, s.workinfoid "
+        "FROM solves s JOIN workers w ON s.worker_id = w.id "
+        "WHERE s.hash = ?", (solve_hash,)).fetchone()
+    if row is None:
+        return None
+    return {
+        "solve_id": row[0],
+        "solve_time": row[1],
+        "worker": row[2],
+        "workinfoid": row[3],
+        "hash": solve_hash,
+    }
+
+# -- Payout distribution ------------------------------------------------------
+
+def distribute_payout(db, amount_sats, solve_id, bcli):
+    """Compute per-worker payouts for a settled coin.
+
+    Returns (solve_id, total_score, {worker_address: sats}) or None if
+    no candidate payout exists.  Workers with invalid addresses are
+    excluded and their share is redistributed to valid workers.
+    """
+    rows = db.execute(
+        "SELECT w.address, cp.score FROM candidate_payouts cp "
+        "JOIN workers w ON cp.worker_id = w.id "
+        "WHERE cp.solve_id = ?",
+        (solve_id,)).fetchall()
+
+    if not rows:
+        logging.warning("No candidate payout for solve %d, value to margin", solve_id)
+        return None
+
+    # Filter to valid addresses
+    valid_rows = []
+    for address, score in rows:
+        if validate_worker_address(bcli, address):
+            valid_rows.append((address, score))
+        else:
+            logging.warning("Excluding invalid address %s from solve %d payout",
+                            address, solve_id)
+    rows = valid_rows
+    if not rows:
+        logging.warning("No valid addresses for solve %d, value to margin", solve_id)
+        return None
+
+    total_score = sum(score for _, score in rows)
+    if total_score <= 0:
+        logging.warning("Zero total score for solve %d", solve_id)
+        return None
+
+    distributable = int(amount_sats * (1 - MARGIN_FRACTION))
+
+    allocations = {}
+    for address, score in rows:
+        amount = int(distributable * score / total_score)
+        if amount > 0:
+            allocations[address] = amount
+
+    return solve_id, total_score, allocations
+
+def dust_lottery(allocations, dust_threshold, seed_bytes):
+    """Apply dust lottery: direct-pay above threshold, lottery below.
+
+    Returns final {worker: sats} dict.
+    """
+    direct = {}
+    dust_pool = {}
+    for worker, amount in allocations.items():
+        if amount >= dust_threshold:
+            direct[worker] = amount
+        else:
+            dust_pool[worker] = amount
+
+    if not dust_pool:
+        return direct
+
+    pool_total = sum(dust_pool.values())
+    n_draws = pool_total // dust_threshold
+    if n_draws == 0:
+        return direct
+    win_amount = pool_total // n_draws
+
+    workers = sorted(dust_pool.keys())
+    weights = [dust_pool[w] for w in workers]
+    cumulative = []
+    running = 0
+    for w in weights:
+        running += w
+        cumulative.append(running)
+
+    lottery_wins = collections.Counter()
+    for i in range(n_draws):
+        draw_seed = sha256(seed_bytes + struct.pack("<I", i))
+        draw_val = int.from_bytes(draw_seed[:8], 'little') % pool_total
+        idx = bisect.bisect_right(cumulative, draw_val)
+        if idx >= len(workers):
+            idx = len(workers) - 1
+        lottery_wins[workers[idx]] += 1
+
+    result = dict(direct)
+    for worker, wins in lottery_wins.items():
+        payout = wins * win_amount
+        result[worker] = result.get(worker, 0) + payout
+
+    return result
+
+# -- Coin watching ------------------------------------------------------------
+
+CoinEvent = collections.namedtuple('CoinEvent', [
+    'txid', 'vout', 'address', 'amount_sats', 'confirmations', 'blockhash',
+    'blockindex', 'solve_hash', 'solve_info',
+])
+
+def record_unmatched(db, txid, vout, amount_sats, reason):
+    db.execute(
+        "INSERT OR IGNORE INTO unmatched_coins "
+        "(txid, vout, amount_sats, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+        (txid, vout, amount_sats, reason, int(time.time())))
+    db.commit()
+    logging.info("Unmatched coin: %s:%d amount=%d reason=%s",
+                 txid, vout, amount_sats, reason)
+
+def scan_wallet(bcli, db, wallet, powcoins_mode, settle_depth):
+    """Scan wallet for settled coins. Returns list of CoinEvents."""
+    known_skip = set()
+    for row in db.execute("SELECT txid, vout FROM unmatched_coins"):
+        known_skip.add(f"{row[0]}:{row[1]}")
+    for row in db.execute("SELECT coin_txid, coin_vout FROM payments"):
+        known_skip.add(f"{row[0]}:{row[1]}")
+
+    coins = bcli_json(bcli, f"-rpcwallet={wallet}", "listunspent", "0")
+    events = []
+    for coin in coins:
+        txid = coin["txid"]
+        vout = coin["vout"]
+        key = f"{txid}:{vout}"
+        if key in known_skip:
+            continue
+        confs = coin.get("confirmations", 0)
+        if confs < settle_depth:
+            continue
+
+        amount_sats = btc_to_sats(coin["amount"])
+        tx_info = bcli_json(bcli, f"-rpcwallet={wallet}", "gettransaction", txid)
+        blockhash = tx_info.get("blockhash")
+        blockindex = tx_info.get("blockindex")
+
+        if blockindex == 0:
+            solve_hash = solve_hash_from_blockhash(blockhash)
+        elif powcoins_mode:
+            try:
+                raw = bcli_json(bcli, "getrawtransaction", txid, "true", blockhash)
+                witness = raw["vin"][0]["txinwitness"]
+                solve_hash = solve_hash_from_powcoins_witness(witness)
+            except Exception as e:
+                record_unmatched(db, txid, vout, amount_sats,
+                                 f"witness extraction failed: {e}")
+                continue
+        else:
+            record_unmatched(db, txid, vout, amount_sats, "non-coinbase in non-powcoins mode")
+            continue
+
+        solve_info = find_solve_in_db(db, solve_hash)
+        if solve_info is None:
+            record_unmatched(db, txid, vout, amount_sats,
+                             f"no matching solve for hash {solve_hash}")
+            continue
+
+        events.append(CoinEvent(
+            txid=txid,
+            vout=vout,
+            address=coin.get("address", ""),
+            amount_sats=amount_sats,
+            confirmations=confs,
+            blockhash=blockhash,
+            blockindex=blockindex,
+            solve_hash=solve_hash,
+            solve_info=solve_info,
+        ))
+        logging.info("Settled coin: %s:%d amount=%d solve=%s worker=%s",
+                     txid, vout, amount_sats,
+                     solve_hash, solve_info.get("worker", "?"))
+
+    return events
+
+# -- Transaction construction -------------------------------------------------
+
+MAX_TX_VSIZE = 10000
+MAX_INPUTS_PER_TX = 200   # cap coins per payout run
+MAX_OUTPUTS_PER_TX = 200  # ~43 vbytes per P2TR output, ~200 vbytes overhead
+
+def build_payout_tx(bcli, coin_wallet, reserve_wallet, payouts, coins=None):
+    """Build, fund, and sign a payout transaction via PSBT.
+
+    coins: list of (txid, vout, address) tuples from the coin wallet.
+    When provided, these are pre-specified inputs with solving_data
+    descriptors.  When None, the tx is funded purely by the reserve wallet.
+
+    payouts: {address: sats, ...}
+    Returns (raw_hex, fee_sats, signed_psbt).
+    """
+    inputs_list = []
+    descriptors = []
+    options = {"add_inputs": True}
+    if FEE_RATE is not None:
+        options["fee_rate"] = FEE_RATE
+
+    if coins:
+        for txid, vout, address in coins:
+            inputs_list.append({"txid": txid, "vout": vout})
+            addr_info = bcli_json(bcli, f"-rpcwallet={coin_wallet}",
+                                  "getaddressinfo", address)
+            desc = addr_info.get("desc")
+            if not desc:
+                raise ValueError(f"No descriptor for {address}")
+            descriptors.append(desc)
+        options["solving_data"] = {"descriptors": descriptors}
+
+    inputs = json.dumps(inputs_list)
+    outputs = json.dumps([{addr: f"{sats / 1e8:.8f}"}
+                          for addr, sats in payouts.items()])
+    options_json = json.dumps(options)
+
+    result = bcli_json(bcli, f"-rpcwallet={reserve_wallet}",
+                       "walletcreatefundedpsbt",
+                       inputs, outputs, "0", options_json)
+    psbt = result["psbt"]
+    fee_btc = result["fee"]
+    logging.debug("Funded PSBT: fee=%.8f changepos=%d", fee_btc, result["changepos"])
+
+    result = bcli_json(bcli, f"-rpcwallet={reserve_wallet}",
+                       "walletprocesspsbt", psbt)
+    psbt = result["psbt"]
+
+    if coins:
+        result = bcli_json(bcli, f"-rpcwallet={coin_wallet}",
+                           "walletprocesspsbt", psbt)
+        psbt = result["psbt"]
+
+    signed_psbt = psbt
+
+    result = bcli_json(bcli, "finalizepsbt", psbt)
+    if not result.get("complete"):
+        raise ValueError("PSBT finalization incomplete")
+
+    return result["hex"], btc_to_sats(fee_btc), signed_psbt
+
+def build_and_send_payouts(bcli, coin_wallet, reserve_wallet, coins, payouts):
+    """Build, sign, and broadcast payout txs, batching if needed.
+
+    coins: list of (txid, vout, address) tuples from the coin wallet.
+    payouts: {address: sats, ...} combined across all coins.
+    Returns list of (txid, fee_sats) for each broadcast tx.
+    """
+    addresses = sorted(payouts.keys())
+    batches = [addresses[i:i + MAX_OUTPUTS_PER_TX]
+               for i in range(0, len(addresses), MAX_OUTPUTS_PER_TX)]
+
+    results = []
+    for i, batch_addrs in enumerate(batches):
+        batch = {a: payouts[a] for a in batch_addrs}
+        if i == 0:
+            raw_hex, fee, _psbt = build_payout_tx(
+                bcli, coin_wallet, reserve_wallet, batch, coins=coins)
+        else:
+            raw_hex, fee, _psbt = build_payout_tx(
+                bcli, coin_wallet, reserve_wallet, batch)
+        txid = bcli("sendrawtransaction", raw_hex)
+        results.append((txid, fee))
+        logging.info("  Batch %d/%d: %s (%d outputs, fee=%d sats)",
+                     i + 1, len(batches), txid, len(batch), fee)
+
+    return results
+
+# -- Workstamp epoch management -----------------------------------------------
+
+def set_L(db, new_L, mindiff):
+    """Change L at the current work counter, appending to epoch_L."""
+    T = get_work_counter(db)
+    row = db.execute(
+        "SELECT workstamp, L, cumulative_log_decay FROM epoch_L "
+        "ORDER BY workstamp DESC LIMIT 1").fetchone()
+    old_ws, old_L, old_cld = row
+    new_cld = old_cld + (T - old_ws) * mindiff / old_L
+    if new_L / mindiff > L_OVER_MINDIFF_LIMIT:
+        raise ValueError(f"L/mindiff = {new_L/mindiff:.2e} exceeds limit 2^57")
+    db.execute(
+        "INSERT INTO epoch_L (workstamp, L, cumulative_log_decay) VALUES (?, ?, ?)",
+        (T, new_L, new_cld))
+    db.execute(
+        "INSERT INTO param_log (date, name, old, new, note) VALUES (?, ?, ?, ?, ?)",
+        (time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()),
+         "L", str(old_L), str(new_L), f"at workstamp {T}"))
+    db.commit()
+    logging.info("L changed: %.6g -> %.6g at workstamp %d", old_L, new_L, T)
+
+def advance_workstamp_epoch(db, mindiff):
+    T = get_work_counter(db)
+    if T < WORKSTAMP_EPOCH_THRESHOLD:
+        return
+
+    adj = WORKSTAMP_EPOCH_ADJUSTMENT
+    logging.info("Advancing workstamp epoch: T=%d, adjustment=%d", T, adj)
+    cur = db.cursor()
+
+    cur.execute("UPDATE work_state SET work_counter = work_counter - ?", (adj,))
+
+    L = get_current_L(db)
+    rows = cur.execute("SELECT worker_id, score, workstamp FROM scores").fetchall()
+    zeroed = 0
+    for worker_id, score, ws in rows:
+        new_ws = ws - adj
+        if new_ws < 0:
+            new_score = decay(score, -new_ws, L, mindiff)
+            if new_score == 0.0:
+                cur.execute("DELETE FROM scores WHERE worker_id = ?", (worker_id,))
+                zeroed += 1
+            else:
+                cur.execute("UPDATE scores SET score = ?, workstamp = 0 WHERE worker_id = ?",
+                            (new_score, worker_id))
+        else:
+            cur.execute("UPDATE scores SET workstamp = ? WHERE worker_id = ?",
+                        (new_ws, worker_id))
+
+    clamped = cur.execute(
+        "SELECT workstamp, L, cumulative_log_decay FROM epoch_L "
+        "WHERE workstamp < ? ORDER BY workstamp DESC LIMIT 1", (adj,)).fetchone()
+    if clamped:
+        clamp_ws, clamp_L, clamp_cld = clamped
+        new_cld = clamp_cld + (adj - clamp_ws) * mindiff / clamp_L
+        cur.execute("DELETE FROM epoch_L WHERE workstamp < ? AND workstamp != ?",
+                    (adj, clamp_ws))
+        cur.execute("UPDATE epoch_L SET workstamp = 0, cumulative_log_decay = ? "
+                    "WHERE workstamp = ?", (new_cld, clamp_ws))
+    cur.execute("UPDATE epoch_L SET workstamp = workstamp - ? WHERE workstamp > 0", (adj,))
+
+    db.commit()
+    new_T = get_work_counter(db)
+    logging.info("Workstamp epoch advanced: new T=%d, %d zero-score workers removed",
+                 new_T, zeroed)
+
+# -- Main ---------------------------------------------------------------------
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Pool payout service for ckpool miners")
+    parser.add_argument("--cli", default="bitcoin-cli -signet", help="bitcoin-cli command")
+    parser.add_argument("--wallet", default="ckpool", help="Coin wallet (receives claims)")
+    parser.add_argument("--reserve-wallet", default="reserve", help="Reserve wallet (fee inputs, margin change)")
+    parser.add_argument("--ckpool-logs", default=None, help="Path to ckpool logs directory")
+    parser.add_argument("--db", default="ckpayout.db", help="SQLite database path")
+    parser.add_argument("--powcoins", action="store_true", help="Enable powcoins witness hash extraction")
+    parser.add_argument("--import-shares", action="store_true", help="Import sharelogs and exit")
+    parser.add_argument("--test-tx", help="Test: extract solve hash from TXID:BLOCKHASH")
+    parser.add_argument("--test-psbt", action="store_true",
+                        help="Build one payout PSBT and print it (no broadcast)")
+    parser.add_argument("--send", action="store_true", help="Build and broadcast payout transactions")
+    parser.add_argument("--L", type=float, default=None,
+                        help="Memory length L (cumulative difficulty); required for new databases")
+    parser.add_argument("--mindiff", type=float, default=MINDIFF,
+                        help=f"Work counter quantization (default {MINDIFF})")
+    parser.add_argument("--set-L", type=float, default=None,
+                        help="Change L to this value at the current work counter")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%SZ")
+    logging.Formatter.converter = time.gmtime
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+
+    bcli = lambda *a: bitcoin_cli(args.cli.split(" "), list(a))
+    db = init_db(args.db, args.L, args.mindiff)
+
+    mindiff = get_mindiff(db)
+
+    if args.set_L is not None:
+        set_L(db, args.set_L, mindiff)
+
+    L = get_current_L(db)
+
+    if L / mindiff > L_OVER_MINDIFF_LIMIT:
+        logging.error("L/mindiff = %.2e exceeds limit 2^57 = %.2e",
+                      L / mindiff, L_OVER_MINDIFF_LIMIT)
+        db.close()
+        return 1
+
+    if args.import_shares:
+        if not args.ckpool_logs:
+            logging.error("--ckpool-logs required for --import-shares")
+            return 1
+        import_sharelogs(db, args.ckpool_logs, mindiff)
+        rows = db.execute(
+            "SELECT w.address, s.score, s.workstamp FROM scores s "
+            "JOIN workers w ON s.worker_id = w.id").fetchall()
+        T = get_work_counter(db)
+        for address, score, workstamp in rows:
+            decayed = decay_between(db, score, workstamp, T, mindiff)
+            logging.info("  worker=%s score=%.2f workstamp=%d (decayed=%.2f)",
+                         address, score, workstamp, decayed)
+        db.close()
+        return 0
+
+    if args.test_tx:
+        txid, blockhash = args.test_tx.split(":")
+        tx = bcli_json(bcli, "getrawtransaction", txid, "true", blockhash)
+        blockindex = tx.get("blockindex")
+        if blockindex is not None and blockindex == 0:
+            solve_hash = solve_hash_from_blockhash(blockhash)
+            logging.info("Coinbase tx, solve hash = block hash: %s", solve_hash)
+        else:
+            witness = tx["vin"][0]["txinwitness"]
+            solve_hash = solve_hash_from_powcoins_witness(witness)
+            logging.info("Powcoins tx, solve hash: %s", solve_hash)
+        solve = find_solve_in_db(db, solve_hash)
+        if solve:
+            logging.info("Matched: worker=%s solve_time=%.3f workinfoid=%s",
+                         solve["worker"], solve["solve_time"], solve["workinfoid"])
+        else:
+            logging.warning("No matching solve found")
+        db.close()
+        return 0
+
+    settle_depth = SETTLE_DEPTH_POWCOINS if args.powcoins else SETTLE_DEPTH_COINBASE
+
+    logging.info("ckpayout: wallet=%s reserve=%s logs=%s powcoins=%s settle=%d L=%.2g mindiff=%g",
+                 args.wallet, args.reserve_wallet, args.ckpool_logs,
+                 args.powcoins, settle_depth, L, mindiff)
+
+    # 1. Import shares + fold scores + record candidate payouts
+    if args.ckpool_logs:
+        import_sharelogs(db, args.ckpool_logs, mindiff)
+
+    # 2. Scan wallet for settled coins
+    events = scan_wallet(bcli, db, args.wallet, args.powcoins,
+                         settle_depth)
+
+    # Cap coins per run to keep transactions within wallet limits
+    deferred_coins = 0
+    if len(events) > MAX_INPUTS_PER_TX:
+        deferred_coins = len(events) - MAX_INPUTS_PER_TX
+        logging.info("Capping settlement to %d of %d coins (rest deferred to next run)",
+                     MAX_INPUTS_PER_TX, len(events))
+        events = events[:MAX_INPUTS_PER_TX]
+
+    # Defer payout if settled coins are too small to justify a tx fee
+    if not args.test_psbt:
+        total_event_value = sum(ev.amount_sats for ev in events)
+        if total_event_value < MIN_PAYOUT_VALUE:
+            logging.info("Settled coins total %d sats (< %d min), deferring payout",
+                         total_event_value, MIN_PAYOUT_VALUE)
+            advance_workstamp_epoch(db, mindiff)
+            db.close()
+            return 0
+
+    # 3. Test PSBT mode: build one payout and print it
+    if args.test_psbt:
+        if not events:
+            logging.error("No settled coins to test with")
+            db.close()
+            return 1
+        ev = events[0]
+        result = distribute_payout(db, ev.amount_sats,
+                                   ev.solve_info["solve_id"], bcli)
+        if result is None:
+            logging.error("No candidate payout for first coin")
+            db.close()
+            return 1
+        solve_id, total_score, alloc = result
+        seed = sha256(bytes.fromhex(ev.blockhash) + bytes.fromhex(ev.txid))
+        final = dust_lottery(alloc, DUST_THRESHOLD, seed)
+        paid = sum(final.values())
+        margin = ev.amount_sats - paid
+        logging.info("Coin %s:%d amount=%d → %d sats to %d workers, margin=%d",
+                     ev.txid, ev.vout, ev.amount_sats,
+                     paid, len(final), margin)
+        for addr, sats in sorted(final.items()):
+            logging.info("  %s → %d sats", addr, sats)
+        _hex, fee, psbt = build_payout_tx(
+            bcli, args.wallet, args.reserve_wallet, final,
+            coins=[(ev.txid, ev.vout, ev.address)])
+        logging.info("Fee: %d sats", fee)
+        print(psbt)
+        db.close()
+        return 0
+
+    # 4. Distribute payouts: compute per-coin raw splits, then batch
+    combined = {}       # worker_address → total sats (pre-lottery)
+    coin_inputs = []    # (txid, vout, address) for tx construction
+    payment_ids = []    # DB payment IDs for tx linkage
+    seed_data = b""     # accumulated seed material for lottery
+    total_coin_value = 0
+
+    cur = db.cursor()
+    for ev in events:
+        result = distribute_payout(db, ev.amount_sats,
+                                   ev.solve_info["solve_id"], bcli)
+        if result is None:
+            # Bug if this happens; will re-warn each run until manually resolved.
+            continue
+        solve_id, total_score, alloc = result
+
+        distributed = sum(alloc.values())
+        cur.execute(
+            "INSERT INTO payments "
+            "(coin_txid, coin_vout, coin_amount, solve_id, total_score, "
+            " total_distributed, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ev.txid, ev.vout, ev.amount_sats, solve_id, total_score,
+             distributed, int(time.time())))
+        payment_id = cur.lastrowid
+        payment_ids.append(payment_id)
+
+        for address, amount in alloc.items():
+            wid = get_worker_id(db, address)
+            cur.execute(
+                "INSERT INTO payment_details "
+                "(payment_id, worker_id, amount) VALUES (?, ?, ?)",
+                (payment_id, wid, amount))
+            combined[address] = combined.get(address, 0) + amount
+
+        coin_inputs.append((ev.txid, ev.vout, ev.address))
+        seed_data += bytes.fromhex(ev.blockhash) + bytes.fromhex(ev.txid)
+        total_coin_value += ev.amount_sats
+
+        margin = ev.amount_sats - distributed
+        logging.info("  %s:%d → %d sats to %d workers, margin=%d (%.1f%%)",
+                     ev.txid, ev.vout, distributed, len(alloc), margin,
+                     100 * margin / ev.amount_sats if ev.amount_sats else 0)
+
+    if not combined:
+        logging.info("No new settled coins to distribute")
+        advance_workstamp_epoch(db, mindiff)
+        db.close()
+        return 0
+
+    # 5. Apply dust lottery to combined totals
+    seed = sha256(seed_data)
+    final = dust_lottery(combined, DUST_THRESHOLD, seed)
+    total_paid = sum(final.values())
+    total_margin = total_coin_value - total_paid
+    deferred_msg = f", {deferred_coins} deferred" if deferred_coins else ""
+    logging.info("Batch: %d coins, %d sats to %d workers, margin=%d (%.1f%%)%s",
+                 len(coin_inputs), total_paid, len(final), total_margin,
+                 100 * total_margin / total_coin_value if total_coin_value else 0,
+                 deferred_msg)
+
+    # 6. Build and send payout transactions
+    if args.send:
+        try:
+            tx_results = build_and_send_payouts(
+                bcli, args.wallet, args.reserve_wallet,
+                coin_inputs, final)
+            payment_txids = ",".join(txid for txid, _ in tx_results)
+            total_fee = sum(fee for _, fee in tx_results)
+            for pid in payment_ids:
+                cur.execute("UPDATE payments SET payment_txid = ? WHERE id = ?",
+                            (payment_txids, pid))
+            db.commit()
+            logging.info("Sent %d payout tx(s), total fee=%d sats",
+                         len(tx_results), total_fee)
+        except Exception as e:
+            logging.error("Failed to build/send payout tx: %s", e)
+            db.rollback()
+    else:
+        logging.info("Dry run (no --send): %d sats to %d workers not committed",
+                     total_paid, len(final))
+        db.rollback()
+
+    # 7. Advance workstamp epoch if needed
+    advance_workstamp_epoch(db, mindiff)
+
+    db.close()
+    return 0
+
+if __name__ == "__main__":
+    exit(main())
