@@ -111,9 +111,12 @@ attempt another:
 $ ./powcoins claim --relay-peer=inquisition.bitcoin-signet.net --max-difficulty=30 --parallel=6 $ADDR
 ```
 
-After relaying, it polls for up to `--wait-confirm` seconds (default 900;
-`0` to skip) and reports, per coin, whether it confirmed or lost to a
-competing spend (naming the winning txid).
+After relaying, it keeps watching each coin — with no time limit by
+default — until it's actually decided, logging status as it goes and
+reporting, per coin, whether it confirmed or lost to a competing spend
+(naming the winning txid). Pass `--wait-confirm=<seconds>` to cap how long
+it watches instead of running indefinitely, or `--no-wait` to skip
+watching altogether and just relay.
 
 A specific coin can also be targeted directly with `--utxo=<txid>:<vout>`
 instead of auto-selecting; it's mutually exclusive with `--parallel`, which
