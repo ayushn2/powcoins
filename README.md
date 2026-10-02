@@ -121,3 +121,10 @@ watching altogether and just relay.
 A specific coin can also be targeted directly with `--utxo=<txid>:<vout>`
 instead of auto-selecting; it's mutually exclusive with `--parallel`, which
 uses it internally to pin each concurrent attempt to a distinct coin.
+
+Note that spreading across more coins doesn't by itself make any single
+contested coin easier to win: when two claims target the same coin, the one
+paying the higher feerate generally wins the race. Use `--fee-bump=<percent>`
+to pay above the estimated (or explicit `--feerate`) rate, e.g.
+`--fee-bump=50` pays 1.5x, to outbid other claimants on coins you expect to
+be contested.
